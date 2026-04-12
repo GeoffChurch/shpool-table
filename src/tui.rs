@@ -99,6 +99,7 @@ pub const NORMAL_BINDINGS: &[Binding] = &[
 /// Footer hints for create mode. The actual byte handling lives in
 /// process_create_input; these just keep the display in sync.
 pub const CREATE_HINTS: &[(&str, &str)] = &[("enter", "create"), ("esc", "cancel")];
+pub const CONFIRM_KILL_HINTS: &[(&str, &str)] = &[("y", "confirm"), ("n", "cancel")];
 
 // -- Input parser --
 
@@ -259,6 +260,20 @@ fn process_confirm_kill(buf: &[u8], model: &mut Model) -> Option<LoopAction> {
 
 // -- Rendering --
 
+fn render_hints(
+    out: &mut impl Write,
+    hints: impl IntoIterator<Item = (&'static str, &'static str)>,
+    separator: &str,
+) -> io::Result<()> {
+    for (i, (label, desc)) in hints.into_iter().enumerate() {
+        if i > 0 {
+            out.write_all(separator.as_bytes())?;
+        }
+        write!(out, "{label}: {desc}")?;
+    }
+    Ok(())
+}
+
 pub fn render(
     model: &Model,
     _width: u16,
@@ -286,27 +301,19 @@ pub fn render(
     match &model.mode {
         Mode::Normal => {
             out.write_all(b"\r\n")?;
-            for (i, b) in NORMAL_BINDINGS.iter().enumerate() {
-                if i > 0 {
-                    out.write_all(b"   ")?;
-                }
-                write!(out, "{}: {}", b.label, b.description)?;
-            }
+            render_hints(out, NORMAL_BINDINGS.iter().map(|b| (b.label, b.description)), "   ")?;
             out.write_all(b"\r\n")?;
         }
         Mode::CreateInput(input) => {
             write!(out, "\r\nnew session: {input}_   (")?;
-            for (i, (label, desc)) in CREATE_HINTS.iter().enumerate() {
-                if i > 0 {
-                    out.write_all(b", ")?;
-                }
-                write!(out, "{label}: {desc}")?;
-            }
+            render_hints(out, CREATE_HINTS.iter().copied(), ", ")?;
             out.write_all(b")\r\n")?;
         }
         Mode::ConfirmKill => {
             if let Some(name) = model.selected_name() {
-                write!(out, "\r\nkill \"{name}\"? (y/n)\r\n")?;
+                write!(out, "\r\nkill \"{name}\"? (")?;
+                render_hints(out, CONFIRM_KILL_HINTS.iter().copied(), ", ")?;
+                out.write_all(b")\r\n")?;
             }
         }
     }
