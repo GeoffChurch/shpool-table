@@ -2,6 +2,7 @@
 name = "shpool-manager"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 description = "A TUI session manager that wraps shpool by shelling out to the shpool CLI."
 license = "Apache-2.0"
 

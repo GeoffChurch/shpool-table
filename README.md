@@ -40,6 +40,9 @@ shpool-manager
 | k            | Kill the selected session (confirms first)|
 | q / Ctrl-C   | Quit                                      |
 
+The TUI footer is the canonical source for key bindings — the table
+above is a convenience snapshot.
+
 When you attach, `shpool attach <name>` takes over the terminal. Detach
 with shpool's keybinding (default `Ctrl-Space Ctrl-q`, configurable in
 `~/.config/shpool/config.toml`) and you're back in the manager.

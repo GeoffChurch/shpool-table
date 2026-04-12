@@ -2,13 +2,13 @@ mod session;
 mod tty;
 mod tui;
 
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, BufWriter, Write};
 use std::process::Command;
 
 use anyhow::{Context, Result};
 
 use crate::session::{ListReply, Session};
-use crate::tui::{InputParser, Model, LoopAction};
+use crate::tui::{InputParser, LoopAction, Model};
 
 fn fetch_sessions() -> Result<Vec<Session>> {
     let out = Command::new("shpool")
@@ -38,6 +38,8 @@ fn main() -> Result<()> {
 }
 
 fn run_tui(initial: Vec<Session>) -> Result<()> {
+    tty::install_sigwinch_handler().context("installing SIGWINCH handler")?;
+
     let mut model = Model::new(initial);
     let mut parser = InputParser::new();
 
@@ -90,7 +92,6 @@ fn event_loop<W: Write>(
     parser: &mut InputParser,
     out: &mut W,
 ) -> Result<LoopAction> {
-    let mut stdin = io::stdin();
     let mut buf = [0u8; 16];
 
     loop {
@@ -98,13 +99,18 @@ fn event_loop<W: Write>(
         tui::render(model, w, h, out)?;
         out.flush()?;
 
-        let n = stdin.read(&mut buf).context("reading stdin")?;
-        if n == 0 {
-            return Ok(LoopAction::Quit);
-        }
-
-        if let Some(action) = tui::process_input(&buf[..n], model, parser) {
-            return Ok(action);
+        match tty::read_stdin(&mut buf) {
+            Ok(0) => return Ok(LoopAction::Quit),
+            Ok(n) => {
+                if let Some(action) = tui::process_input(&buf[..n], model, parser) {
+                    return Ok(action);
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                // SIGWINCH — loop back to re-query tty_size and redraw.
+                continue;
+            }
+            Err(e) => return Err(e).context("reading stdin"),
         }
     }
 }

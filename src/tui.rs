@@ -6,7 +6,7 @@ use crate::session::Session;
 pub enum Mode {
     Normal,
     CreateInput(String),
-    ConfirmKill,
+    ConfirmKill(String),
 }
 
 pub struct Model {
@@ -175,7 +175,7 @@ pub fn process_input(
     match model.mode {
         Mode::Normal => process_normal(buf, model, parser),
         Mode::CreateInput(_) => process_create_input(buf, model),
-        Mode::ConfirmKill => process_confirm_kill(buf, model),
+        Mode::ConfirmKill(_) => process_confirm_kill(buf, model),
     }
 }
 
@@ -198,8 +198,8 @@ fn process_normal(
                 return None;
             }
             Some(Key::KillSession) => {
-                if model.selected_name().is_some() {
-                    model.mode = Mode::ConfirmKill;
+                if let Some(name) = model.selected_name() {
+                    model.mode = Mode::ConfirmKill(name.to_string());
                 }
                 return None;
             }
@@ -246,9 +246,10 @@ fn process_create_input(buf: &[u8], model: &mut Model) -> Option<LoopAction> {
 fn process_confirm_kill(buf: &[u8], model: &mut Model) -> Option<LoopAction> {
     for &b in buf {
         if b == b'y' || b == b'Y' {
-            model.mode = Mode::Normal;
-            if let Some(name) = model.selected_name() {
-                return Some(LoopAction::Kill(name.to_string()));
+            if let Mode::ConfirmKill(ref name) = model.mode {
+                let name = name.clone();
+                model.mode = Mode::Normal;
+                return Some(LoopAction::Kill(name));
             }
         } else {
             model.mode = Mode::Normal;
@@ -274,12 +275,17 @@ fn render_hints(
     Ok(())
 }
 
+// Header (2 lines) + blank before footer + footer (1 line) = 4 lines of overhead.
+const CHROME_LINES: usize = 4;
+
 pub fn render(
     model: &Model,
-    _width: u16,
-    _height: u16,
+    width: u16,
+    height: u16,
     out: &mut impl Write,
 ) -> io::Result<()> {
+    let w = width as usize;
+
     out.write_all(b"\x1b[2J\x1b[H")?;
 
     write!(out, "shpool sessions ({} total)\r\n\r\n", model.sessions.len())?;
@@ -287,13 +293,20 @@ pub fn render(
     if model.sessions.is_empty() {
         out.write_all(b"  (no sessions)\r\n")?;
     } else {
-        for (i, s) in model.sessions.iter().enumerate() {
-            if i == model.selected {
-                out.write_all(b"\x1b[7m")?;
-                write!(out, "> {}  [{}]", s.name, s.status.as_str())?;
-                out.write_all(b"\x1b[0m\r\n")?;
+        let max_visible = (height as usize).saturating_sub(CHROME_LINES);
+        let (start, end) = viewport(model.sessions.len(), model.selected, max_visible);
+
+        for (i, s) in model.sessions[start..end].iter().enumerate() {
+            let abs_i = start + i;
+            let text = if abs_i == model.selected {
+                format!("> {}  [{}]", s.name, s.status.as_str())
             } else {
-                write!(out, "  {}  [{}]\r\n", s.name, s.status.as_str())?;
+                format!("  {}  [{}]", s.name, s.status.as_str())
+            };
+            if abs_i == model.selected {
+                write!(out, "\x1b[7m{text:<w$}\x1b[0m\r\n")?;
+            } else {
+                write!(out, "{text:<w$}\r\n")?;
             }
         }
     }
@@ -309,16 +322,25 @@ pub fn render(
             render_hints(out, CREATE_HINTS.iter().copied(), ", ")?;
             out.write_all(b")\r\n")?;
         }
-        Mode::ConfirmKill => {
-            if let Some(name) = model.selected_name() {
-                write!(out, "\r\nkill \"{name}\"? (")?;
-                render_hints(out, CONFIRM_KILL_HINTS.iter().copied(), ", ")?;
-                out.write_all(b")\r\n")?;
-            }
+        Mode::ConfirmKill(name) => {
+            write!(out, "\r\nkill \"{name}\"? (")?;
+            render_hints(out, CONFIRM_KILL_HINTS.iter().copied(), ", ")?;
+            out.write_all(b")\r\n")?;
         }
     }
 
     Ok(())
+}
+
+/// Compute the visible window [start, end) that keeps `selected` on screen.
+fn viewport(total: usize, selected: usize, max_visible: usize) -> (usize, usize) {
+    if total <= max_visible {
+        return (0, total);
+    }
+    let half = max_visible / 2;
+    let ideal_start = selected.saturating_sub(half);
+    let start = ideal_start.min(total.saturating_sub(max_visible));
+    (start, start + max_visible)
 }
 
 #[cfg(test)]
@@ -534,7 +556,7 @@ mod tests {
         let mut m = Model::new(vec![mk("a"), mk("b")]);
         let mut p = InputParser::new();
         assert_eq!(process_input(b"k", &mut m, &mut p), None);
-        assert_eq!(m.mode, Mode::ConfirmKill);
+        assert_eq!(m.mode, Mode::ConfirmKill("a".into()));
         assert_eq!(process_input(b"y", &mut m, &mut p), Some(LoopAction::Kill("a".into())));
         assert_eq!(m.mode, Mode::Normal);
     }
@@ -554,5 +576,27 @@ mod tests {
         let mut p = InputParser::new();
         assert_eq!(process_input(b"k", &mut m, &mut p), None);
         assert_eq!(m.mode, Mode::Normal);
+    }
+
+    // -- Viewport --
+
+    #[test]
+    fn viewport_fits() {
+        assert_eq!(viewport(3, 0, 10), (0, 3));
+    }
+
+    #[test]
+    fn viewport_scrolls_down() {
+        assert_eq!(viewport(20, 15, 5), (13, 18));
+    }
+
+    #[test]
+    fn viewport_clamps_to_end() {
+        assert_eq!(viewport(20, 19, 5), (15, 20));
+    }
+
+    #[test]
+    fn viewport_centers_selected() {
+        assert_eq!(viewport(20, 10, 5), (8, 13));
     }
 }
