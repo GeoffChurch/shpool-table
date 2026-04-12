@@ -61,18 +61,46 @@ pub enum LoopAction {
     Quit,
 }
 
+// -- Key binding tables --
+//
+// These tables are the single source of truth for both the parser's
+// key dispatch and the footer text rendered in each mode. Bindings
+// come in two flavors:
+//
+//   Trigger::Byte(byte, key) — a single byte that the parser matches
+//       via table lookup in its Normal state. Adding an entry here
+//       automatically wires up both the parser and the footer.
+//
+//   Trigger::BuiltIn — a multi-byte escape sequence (e.g., arrow keys)
+//       or a key with multiple trigger bytes (e.g., Enter = CR or LF).
+//       These are matched by hardcoded logic in the parser's state
+//       machine, but listed here so the footer is generated from the
+//       same source.
+
+pub enum Trigger {
+    Byte(u8, Key),
+    BuiltIn,
+}
+
 pub struct Binding {
-    pub byte: u8,
-    pub key: Key,
+    pub trigger: Trigger,
     pub label: &'static str,
     pub description: &'static str,
 }
 
 pub const NORMAL_BINDINGS: &[Binding] = &[
-    Binding { byte: b'n', key: Key::NewSession, label: "n", description: "new" },
-    Binding { byte: b'k', key: Key::KillSession, label: "k", description: "kill" },
-    Binding { byte: b'q', key: Key::Quit, label: "q", description: "quit" },
+    Binding { trigger: Trigger::BuiltIn, label: "up/down", description: "navigate" },
+    Binding { trigger: Trigger::BuiltIn, label: "enter", description: "attach" },
+    Binding { trigger: Trigger::Byte(b'n', Key::NewSession), label: "n", description: "new" },
+    Binding { trigger: Trigger::Byte(b'k', Key::KillSession), label: "k", description: "kill" },
+    Binding { trigger: Trigger::Byte(b'q', Key::Quit), label: "q", description: "quit" },
 ];
+
+/// Footer hints for create mode. The actual byte handling lives in
+/// process_create_input; these just keep the display in sync.
+pub const CREATE_HINTS: &[(&str, &str)] = &[("enter", "create"), ("esc", "cancel")];
+
+// -- Input parser --
 
 #[derive(Default)]
 pub struct InputParser {
@@ -95,11 +123,15 @@ impl InputParser {
     pub fn feed(&mut self, byte: u8) -> Option<Key> {
         match self.state {
             ParserState::Normal => {
+                // Table-driven dispatch for single-byte bindings.
                 for binding in NORMAL_BINDINGS {
-                    if byte == binding.byte {
-                        return Some(binding.key);
+                    if let Trigger::Byte(b, key) = binding.trigger {
+                        if byte == b {
+                            return Some(key);
+                        }
                     }
                 }
+                // Built-in keys: multi-byte sequences and control chars.
                 match byte {
                     b'\r' | b'\n' => Some(Key::Enter),
                     0x03 => Some(Key::Quit),
@@ -131,6 +163,8 @@ impl InputParser {
         }
     }
 }
+
+// -- Input processing --
 
 pub fn process_input(
     buf: &[u8],
@@ -196,7 +230,7 @@ fn process_create_input(buf: &[u8], model: &mut Model) -> Option<LoopAction> {
                     name.pop();
                 }
             }
-            // Printable non-space ASCII (shpool rejects whitespace in names)
+            // Printable non-space ASCII (shpool rejects whitespace in names).
             b if (0x21..=0x7e).contains(&b) => {
                 if let Mode::CreateInput(ref mut name) = model.mode {
                     name.push(b as char);
@@ -222,6 +256,8 @@ fn process_confirm_kill(buf: &[u8], model: &mut Model) -> Option<LoopAction> {
     }
     None
 }
+
+// -- Rendering --
 
 pub fn render(
     model: &Model,
@@ -249,14 +285,24 @@ pub fn render(
 
     match &model.mode {
         Mode::Normal => {
-            out.write_all(b"\r\nup/down: navigate   enter: attach")?;
-            for b in NORMAL_BINDINGS {
-                write!(out, "   {}: {}", b.label, b.description)?;
+            out.write_all(b"\r\n")?;
+            for (i, b) in NORMAL_BINDINGS.iter().enumerate() {
+                if i > 0 {
+                    out.write_all(b"   ")?;
+                }
+                write!(out, "{}: {}", b.label, b.description)?;
             }
             out.write_all(b"\r\n")?;
         }
         Mode::CreateInput(input) => {
-            write!(out, "\r\nnew session: {input}_   (enter: create, esc: cancel)\r\n")?;
+            write!(out, "\r\nnew session: {input}_   (")?;
+            for (i, (label, desc)) in CREATE_HINTS.iter().enumerate() {
+                if i > 0 {
+                    out.write_all(b", ")?;
+                }
+                write!(out, "{label}: {desc}")?;
+            }
+            out.write_all(b")\r\n")?;
         }
         Mode::ConfirmKill => {
             if let Some(name) = model.selected_name() {
