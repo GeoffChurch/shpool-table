@@ -44,6 +44,12 @@ pub enum Key {
     Other,
 }
 
+#[derive(Debug, PartialEq)]
+pub enum LoopAction {
+    Attach(String),
+    Quit,
+}
+
 #[derive(Default)]
 pub struct InputParser {
     state: ParserState,
@@ -93,6 +99,27 @@ impl InputParser {
             }
         }
     }
+}
+
+pub fn process_input(
+    buf: &[u8],
+    model: &mut Model,
+    parser: &mut InputParser,
+) -> Option<LoopAction> {
+    for &b in buf {
+        match parser.feed(b) {
+            Some(Key::Up) => model.select_prev(),
+            Some(Key::Down) => model.select_next(),
+            Some(Key::Enter) => {
+                if let Some(name) = model.selected_name() {
+                    return Some(LoopAction::Attach(name.to_string()));
+                }
+            }
+            Some(Key::Quit) => return Some(LoopAction::Quit),
+            _ => {}
+        }
+    }
+    None
 }
 
 pub fn render(
@@ -211,5 +238,51 @@ mod tests {
             }
         }
         assert_eq!(out, vec![Key::Down, Key::Down, Key::Enter]);
+    }
+
+    #[test]
+    fn process_input_navigate_and_attach() {
+        let mut m = Model::new(vec![mk("a"), mk("b"), mk("c")]);
+        let mut p = InputParser::new();
+        // Down, Down, Enter → attach "c"
+        let input = [0x1b, b'[', b'B', 0x1b, b'[', b'B', b'\r'];
+        assert_eq!(process_input(&input, &mut m, &mut p), Some(LoopAction::Attach("c".into())));
+    }
+
+    #[test]
+    fn process_input_up_wraps_and_attach() {
+        let mut m = Model::new(vec![mk("x"), mk("y"), mk("z")]);
+        let mut p = InputParser::new();
+        // Up wraps to "z", Enter
+        let input = [0x1b, b'[', b'A', b'\r'];
+        assert_eq!(process_input(&input, &mut m, &mut p), Some(LoopAction::Attach("z".into())));
+    }
+
+    #[test]
+    fn process_input_quit() {
+        let mut m = Model::new(vec![mk("a")]);
+        let mut p = InputParser::new();
+        assert_eq!(process_input(b"q", &mut m, &mut p), Some(LoopAction::Quit));
+    }
+
+    #[test]
+    fn process_input_ctrl_c() {
+        let mut m = Model::new(vec![mk("a")]);
+        let mut p = InputParser::new();
+        assert_eq!(process_input(&[0x03], &mut m, &mut p), Some(LoopAction::Quit));
+    }
+
+    #[test]
+    fn process_input_enter_empty_list() {
+        let mut m = Model::new(vec![]);
+        let mut p = InputParser::new();
+        assert_eq!(process_input(b"\r", &mut m, &mut p), None);
+    }
+
+    #[test]
+    fn process_input_ignores_other_keys() {
+        let mut m = Model::new(vec![mk("a")]);
+        let mut p = InputParser::new();
+        assert_eq!(process_input(b"xyz", &mut m, &mut p), None);
     }
 }

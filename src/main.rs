@@ -8,12 +8,7 @@ use std::process::Command;
 use anyhow::{Context, Result};
 
 use crate::session::{ListReply, Session};
-use crate::tui::{InputParser, Key, Model};
-
-enum LoopAction {
-    Attach(String),
-    Quit,
-}
+use crate::tui::{InputParser, Model, LoopAction};
 
 fn fetch_sessions() -> Result<Vec<Session>> {
     let out = Command::new("shpool")
@@ -97,18 +92,8 @@ fn event_loop<W: Write>(
             return Ok(LoopAction::Quit);
         }
 
-        for &b in &buf[..n] {
-            match parser.feed(b) {
-                Some(Key::Up) => model.select_prev(),
-                Some(Key::Down) => model.select_next(),
-                Some(Key::Enter) => {
-                    if let Some(name) = model.selected_name() {
-                        return Ok(LoopAction::Attach(name.to_string()));
-                    }
-                }
-                Some(Key::Quit) => return Ok(LoopAction::Quit),
-                _ => {}
-            }
+        if let Some(action) = tui::process_input(&buf[..n], model, parser) {
+            return Ok(action);
         }
     }
 }
