@@ -88,7 +88,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "shpool-manager"
+name = "shpool-table"
 version = "0.1.0"
 dependencies = [
  "anyhow",

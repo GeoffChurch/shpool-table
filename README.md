@@ -1,8 +1,8 @@
-# shpool-manager
+# shpool-table
 
 A lightweight TUI for managing [shpool] sessions.
 
-`shpool-manager` is **not** a shpool session itself — it's a standalone
+`shpool-table` is **not** a shpool session itself — it's a standalone
 process that owns your terminal, shows your sessions in a navigable list,
 and spawns `shpool attach` when you pick one. When you detach from a
 session (via shpool's detach keybinding), you land back in the manager's
@@ -23,13 +23,13 @@ Or to build from source without installing:
 
 ```
 cargo build --release
-# binary at target/release/shpool-manager
+# binary at target/release/shpool-table
 ```
 
 ## Usage
 
 ```
-shpool-manager
+shpool-table
 ```
 
 | Key          | Action                                    |
@@ -54,28 +54,28 @@ Set your SSH config to land directly in the manager:
 ```
 Host myserver
     Hostname remote.example.com
-    RemoteCommand shpool-manager
+    RemoteCommand shpool-table
     RequestTTY yes
 ```
 
 ### Alongside tmux or other multiplexers
 
-`shpool-manager` handles session navigation, not terminal multiplexing.
+`shpool-table` handles session navigation, not terminal multiplexing.
 If you want split panes or tiled windows, run your multiplexer as the
-outer layer and `shpool-manager` inside each pane:
+outer layer and `shpool-table` inside each pane:
 
-- **tmux / zellij**: each pane runs `shpool-manager`, you pick a shpool
+- **tmux / zellij**: each pane runs `shpool-table`, you pick a shpool
   session per pane. Your multiplexer layout persists independently from
   your shpool sessions — detaching from shpool drops you back to the
   manager in that pane, not out of the multiplexer.
 - **dtach / abduco**: same idea — these handle persistence at the
   multiplexer level while shpool handles it at the shell level.
 - **Tiling window managers** (sway, i3, etc.): each terminal window runs
-  `shpool-manager` directly.
+  `shpool-table` directly.
 
 ## Multiplexing and previews
 
-`shpool-manager` doesn't currently multiplex (show multiple sessions
+`shpool-table` doesn't currently multiplex (show multiple sessions
 side-by-side). This is possible in principle — shpool continuously
 maintains an in-memory virtual terminal render of every session (via
 `shpool_vt100`), so a future version could display live previews or a
@@ -88,7 +88,7 @@ subcommand). See [Future directions](#future-directions) below.
 The manager shells out to the `shpool` CLI rather than using
 `shpool-protocol` directly. Per shpool's version policy, the CLI is a
 public, semver-stable interface while the wire protocol is explicitly
-not — shelling out means `shpool-manager` survives shpool upgrades
+not — shelling out means `shpool-table` survives shpool upgrades
 without breakage, and inherits autodaemonization, socket discovery, and
 version negotiation for free.
 
@@ -148,7 +148,7 @@ dependency.
 
 - **Session previews.** The cleanest path is a `shpool peek <name>`
   upstream subcommand that prints the daemon's in-memory screen snapshot
-  as ANSI. `shpool-manager` could then show a preview pane without
+  as ANSI. `shpool-table` could then show a preview pane without
   leaving the CLI-only, shell-out architecture.
 - **Resize handling.** Redraw the manager's own menu on `SIGWINCH`
   (currently redraws on next keypress).
