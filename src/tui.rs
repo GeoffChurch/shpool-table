@@ -61,6 +61,19 @@ pub enum LoopAction {
     Quit,
 }
 
+pub struct Binding {
+    pub byte: u8,
+    pub key: Key,
+    pub label: &'static str,
+    pub description: &'static str,
+}
+
+pub const NORMAL_BINDINGS: &[Binding] = &[
+    Binding { byte: b'n', key: Key::NewSession, label: "n", description: "new" },
+    Binding { byte: b'k', key: Key::KillSession, label: "k", description: "kill" },
+    Binding { byte: b'q', key: Key::Quit, label: "q", description: "quit" },
+];
+
 #[derive(Default)]
 pub struct InputParser {
     state: ParserState,
@@ -81,17 +94,22 @@ impl InputParser {
 
     pub fn feed(&mut self, byte: u8) -> Option<Key> {
         match self.state {
-            ParserState::Normal => match byte {
-                b'\r' | b'\n' => Some(Key::Enter),
-                b'q' | 0x03 => Some(Key::Quit),
-                b'n' => Some(Key::NewSession),
-                b'k' => Some(Key::KillSession),
-                0x1b => {
-                    self.state = ParserState::Esc;
-                    None
+            ParserState::Normal => {
+                for binding in NORMAL_BINDINGS {
+                    if byte == binding.byte {
+                        return Some(binding.key);
+                    }
                 }
-                _ => Some(Key::Other),
-            },
+                match byte {
+                    b'\r' | b'\n' => Some(Key::Enter),
+                    0x03 => Some(Key::Quit),
+                    0x1b => {
+                        self.state = ParserState::Esc;
+                        None
+                    }
+                    _ => Some(Key::Other),
+                }
+            }
             ParserState::Esc => match byte {
                 b'[' => {
                     self.state = ParserState::EscBracket;
@@ -151,7 +169,7 @@ fn process_normal(
                 return None;
             }
             Some(Key::Quit) => return Some(LoopAction::Quit),
-            _ => {}
+            Some(Key::Other) | None => {}
         }
     }
     None
@@ -231,9 +249,11 @@ pub fn render(
 
     match &model.mode {
         Mode::Normal => {
-            out.write_all(
-                b"\r\nup/down: navigate   enter: attach   n: new   k: kill   q: quit\r\n",
-            )?;
+            out.write_all(b"\r\nup/down: navigate   enter: attach")?;
+            for b in NORMAL_BINDINGS {
+                write!(out, "   {}: {}", b.label, b.description)?;
+            }
+            out.write_all(b"\r\n")?;
         }
         Mode::CreateInput(input) => {
             write!(out, "\r\nnew session: {input}_   (enter: create, esc: cancel)\r\n")?;
