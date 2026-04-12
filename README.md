@@ -56,9 +56,15 @@ Set your SSH config to land directly in the manager:
 ```
 Host myserver
     Hostname remote.example.com
-    RemoteCommand shpool-table
+    RemoteCommand bash -lc "shpool-table"
     RequestTTY yes
 ```
+
+The `bash -lc` wrapper runs a login shell so `~/.cargo/bin` gets added
+to `PATH` via your shell's profile scripts. Without it, SSH invokes a
+non-interactive non-login shell, which doesn't source `.bashrc` or
+`.profile` and so `shpool-table` isn't found. Skip the wrapper only if
+you've put the binary on the system `PATH` some other way.
 
 ### Alongside tmux or other multiplexers
 
