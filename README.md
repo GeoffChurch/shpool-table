@@ -16,12 +16,14 @@ the manager exists.
 Requires [shpool] and a Rust toolchain (1.85+).
 
 ```
-cargo install --path .
+cargo install --git https://github.com/GeoffChurch/shpool-table
 ```
 
-Or to build from source without installing:
+To hack on it locally instead:
 
 ```
+git clone https://github.com/GeoffChurch/shpool-table
+cd shpool-table
 cargo build --release
 # binary at target/release/shpool-table
 ```
