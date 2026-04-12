@@ -48,11 +48,6 @@ pub fn tty_size() -> Result<(u16, u16)> {
     Ok((ws.ws_col, ws.ws_row))
 }
 
-/// True when both stdin and stdout are connected to a terminal.
-pub fn is_interactive() -> bool {
-    unsafe { libc::isatty(libc::STDIN_FILENO) == 1 && libc::isatty(libc::STDOUT_FILENO) == 1 }
-}
-
 /// Install a no-op SIGWINCH handler so the signal interrupts blocking
 /// reads (libc::read returns EINTR) instead of being silently ignored.
 /// This lets the event loop re-query terminal size and redraw on resize.

@@ -26,14 +26,6 @@ fn fetch_sessions() -> Result<Vec<Session>> {
 
 fn main() -> Result<()> {
     let sessions = fetch_sessions()?;
-
-    if !tty::is_interactive() {
-        for s in &sessions {
-            println!("{}\t{}", s.name, s.status.as_str());
-        }
-        return Ok(());
-    }
-
     run_tui(sessions)
 }
 

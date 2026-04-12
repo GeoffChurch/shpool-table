@@ -47,9 +47,6 @@ When you attach, `shpool attach <name>` takes over the terminal. Detach
 with shpool's keybinding (default `Ctrl-Space Ctrl-q`, configurable in
 `~/.config/shpool/config.toml`) and you're back in the manager.
 
-If stdin or stdout is not a TTY (e.g., piped), the manager falls back to
-printing the session list tab-separated — useful for scripting.
-
 ### As an SSH entry-point
 
 Set your SSH config to land directly in the manager:
