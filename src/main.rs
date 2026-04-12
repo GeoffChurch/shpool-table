@@ -69,6 +69,17 @@ fn run_tui(initial: Vec<Session>) -> Result<()> {
                     model.selected = i;
                 }
             }
+            LoopAction::Kill(name) => {
+                Command::new("shpool")
+                    .args(["kill", &name])
+                    .status()
+                    .context("running `shpool kill`")?;
+
+                let prev_idx = model.selected;
+                let new_sessions = fetch_sessions()?;
+                model = Model::new(new_sessions);
+                model.selected = prev_idx.min(model.sessions.len().saturating_sub(1));
+            }
             LoopAction::Quit => return Ok(()),
         }
     }

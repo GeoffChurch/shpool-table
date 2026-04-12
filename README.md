@@ -36,6 +36,8 @@ shpool-manager
 |--------------|-------------------------------------------|
 | Up / Down    | Move selection                            |
 | Enter        | Attach to the selected session            |
+| n            | Create a new session (prompts for name)   |
+| k            | Kill the selected session (confirms first)|
 | q / Ctrl-C   | Quit                                      |
 
 When you attach, `shpool attach <name>` takes over the terminal. Detach
@@ -148,6 +150,5 @@ dependency.
   upstream subcommand that prints the daemon's in-memory screen snapshot
   as ANSI. `shpool-manager` could then show a preview pane without
   leaving the CLI-only, shell-out architecture.
-- **Create / kill from the TUI.** `n` to create a new named session,
-  `k` to kill the highlighted one.
-- **Resize handling.** Redraw on `SIGWINCH`.
+- **Resize handling.** Redraw the manager's own menu on `SIGWINCH`
+  (currently redraws on next keypress).

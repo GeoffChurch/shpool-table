@@ -2,14 +2,22 @@ use std::io::{self, Write};
 
 use crate::session::Session;
 
+#[derive(Debug, PartialEq)]
+pub enum Mode {
+    Normal,
+    CreateInput(String),
+    ConfirmKill,
+}
+
 pub struct Model {
     pub sessions: Vec<Session>,
     pub selected: usize,
+    pub mode: Mode,
 }
 
 impl Model {
     pub fn new(sessions: Vec<Session>) -> Self {
-        Self { sessions, selected: 0 }
+        Self { sessions, selected: 0, mode: Mode::Normal }
     }
 
     pub fn select_next(&mut self) {
@@ -41,12 +49,15 @@ pub enum Key {
     Down,
     Enter,
     Quit,
+    NewSession,
+    KillSession,
     Other,
 }
 
 #[derive(Debug, PartialEq)]
 pub enum LoopAction {
     Attach(String),
+    Kill(String),
     Quit,
 }
 
@@ -73,6 +84,8 @@ impl InputParser {
             ParserState::Normal => match byte {
                 b'\r' | b'\n' => Some(Key::Enter),
                 b'q' | 0x03 => Some(Key::Quit),
+                b'n' => Some(Key::NewSession),
+                b'k' => Some(Key::KillSession),
                 0x1b => {
                     self.state = ParserState::Esc;
                     None
@@ -106,6 +119,18 @@ pub fn process_input(
     model: &mut Model,
     parser: &mut InputParser,
 ) -> Option<LoopAction> {
+    match model.mode {
+        Mode::Normal => process_normal(buf, model, parser),
+        Mode::CreateInput(_) => process_create_input(buf, model),
+        Mode::ConfirmKill => process_confirm_kill(buf, model),
+    }
+}
+
+fn process_normal(
+    buf: &[u8],
+    model: &mut Model,
+    parser: &mut InputParser,
+) -> Option<LoopAction> {
     for &b in buf {
         match parser.feed(b) {
             Some(Key::Up) => model.select_prev(),
@@ -115,8 +140,66 @@ pub fn process_input(
                     return Some(LoopAction::Attach(name.to_string()));
                 }
             }
+            Some(Key::NewSession) => {
+                model.mode = Mode::CreateInput(String::new());
+                return None;
+            }
+            Some(Key::KillSession) => {
+                if model.selected_name().is_some() {
+                    model.mode = Mode::ConfirmKill;
+                }
+                return None;
+            }
             Some(Key::Quit) => return Some(LoopAction::Quit),
             _ => {}
+        }
+    }
+    None
+}
+
+fn process_create_input(buf: &[u8], model: &mut Model) -> Option<LoopAction> {
+    for &b in buf {
+        match b {
+            0x0d | 0x0a => {
+                if let Mode::CreateInput(ref name) = model.mode {
+                    if !name.is_empty() {
+                        let name = name.clone();
+                        model.mode = Mode::Normal;
+                        return Some(LoopAction::Attach(name));
+                    }
+                }
+            }
+            0x1b | 0x03 => {
+                model.mode = Mode::Normal;
+                return None;
+            }
+            0x7f | 0x08 => {
+                if let Mode::CreateInput(ref mut name) = model.mode {
+                    name.pop();
+                }
+            }
+            // Printable non-space ASCII (shpool rejects whitespace in names)
+            b if (0x21..=0x7e).contains(&b) => {
+                if let Mode::CreateInput(ref mut name) = model.mode {
+                    name.push(b as char);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn process_confirm_kill(buf: &[u8], model: &mut Model) -> Option<LoopAction> {
+    for &b in buf {
+        if b == b'y' || b == b'Y' {
+            model.mode = Mode::Normal;
+            if let Some(name) = model.selected_name() {
+                return Some(LoopAction::Kill(name.to_string()));
+            }
+        } else {
+            model.mode = Mode::Normal;
+            return None;
         }
     }
     None
@@ -133,7 +216,7 @@ pub fn render(
     write!(out, "shpool sessions ({} total)\r\n\r\n", model.sessions.len())?;
 
     if model.sessions.is_empty() {
-        out.write_all(b"  (no sessions \xe2\x80\x94 press q to quit)\r\n")?;
+        out.write_all(b"  (no sessions)\r\n")?;
     } else {
         for (i, s) in model.sessions.iter().enumerate() {
             if i == model.selected {
@@ -146,7 +229,21 @@ pub fn render(
         }
     }
 
-    out.write_all(b"\r\nup/down: navigate   enter: attach   q: quit\r\n")?;
+    match &model.mode {
+        Mode::Normal => {
+            out.write_all(
+                b"\r\nup/down: navigate   enter: attach   n: new   k: kill   q: quit\r\n",
+            )?;
+        }
+        Mode::CreateInput(input) => {
+            write!(out, "\r\nnew session: {input}_   (enter: create, esc: cancel)\r\n")?;
+        }
+        Mode::ConfirmKill => {
+            if let Some(name) = model.selected_name() {
+                write!(out, "\r\nkill \"{name}\"? (y/n)\r\n")?;
+            }
+        }
+    }
 
     Ok(())
 }
@@ -159,6 +256,8 @@ mod tests {
     fn mk(name: &str) -> Session {
         Session { name: name.to_string(), status: SessionStatus::Disconnected }
     }
+
+    // -- Model tests --
 
     #[test]
     fn select_next_wraps() {
@@ -189,6 +288,8 @@ mod tests {
         assert_eq!(m.selected, 0);
         assert_eq!(m.selected_name(), None);
     }
+
+    // -- Parser tests --
 
     #[test]
     fn parser_up_arrow() {
@@ -221,6 +322,18 @@ mod tests {
     }
 
     #[test]
+    fn parser_new_session() {
+        let mut p = InputParser::new();
+        assert_eq!(p.feed(b'n'), Some(Key::NewSession));
+    }
+
+    #[test]
+    fn parser_kill_session() {
+        let mut p = InputParser::new();
+        assert_eq!(p.feed(b'k'), Some(Key::KillSession));
+    }
+
+    #[test]
     fn parser_unknown_esc_sequence() {
         let mut p = InputParser::new();
         assert_eq!(p.feed(0x1b), None);
@@ -240,11 +353,12 @@ mod tests {
         assert_eq!(out, vec![Key::Down, Key::Down, Key::Enter]);
     }
 
+    // -- process_input: normal mode --
+
     #[test]
     fn process_input_navigate_and_attach() {
         let mut m = Model::new(vec![mk("a"), mk("b"), mk("c")]);
         let mut p = InputParser::new();
-        // Down, Down, Enter → attach "c"
         let input = [0x1b, b'[', b'B', 0x1b, b'[', b'B', b'\r'];
         assert_eq!(process_input(&input, &mut m, &mut p), Some(LoopAction::Attach("c".into())));
     }
@@ -253,7 +367,6 @@ mod tests {
     fn process_input_up_wraps_and_attach() {
         let mut m = Model::new(vec![mk("x"), mk("y"), mk("z")]);
         let mut p = InputParser::new();
-        // Up wraps to "z", Enter
         let input = [0x1b, b'[', b'A', b'\r'];
         assert_eq!(process_input(&input, &mut m, &mut p), Some(LoopAction::Attach("z".into())));
     }
@@ -284,5 +397,89 @@ mod tests {
         let mut m = Model::new(vec![mk("a")]);
         let mut p = InputParser::new();
         assert_eq!(process_input(b"xyz", &mut m, &mut p), None);
+    }
+
+    // -- process_input: create mode --
+
+    #[test]
+    fn process_input_create_flow() {
+        let mut m = Model::new(vec![mk("a")]);
+        let mut p = InputParser::new();
+        assert_eq!(process_input(b"n", &mut m, &mut p), None);
+        assert_eq!(m.mode, Mode::CreateInput(String::new()));
+        assert_eq!(
+            process_input(b"foo\r", &mut m, &mut p),
+            Some(LoopAction::Attach("foo".into()))
+        );
+        assert_eq!(m.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn process_input_create_cancel() {
+        let mut m = Model::new(vec![mk("a")]);
+        let mut p = InputParser::new();
+        assert_eq!(process_input(b"n", &mut m, &mut p), None);
+        assert_eq!(process_input(b"bar\x1b", &mut m, &mut p), None);
+        assert_eq!(m.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn process_input_create_backspace() {
+        let mut m = Model::new(vec![mk("a")]);
+        let mut p = InputParser::new();
+        assert_eq!(process_input(b"n", &mut m, &mut p), None);
+        assert_eq!(
+            process_input(b"ab\x7fc\r", &mut m, &mut p),
+            Some(LoopAction::Attach("ac".into()))
+        );
+    }
+
+    #[test]
+    fn process_input_create_reject_empty() {
+        let mut m = Model::new(vec![mk("a")]);
+        let mut p = InputParser::new();
+        assert_eq!(process_input(b"n", &mut m, &mut p), None);
+        assert_eq!(process_input(b"\r", &mut m, &mut p), None);
+        assert_eq!(m.mode, Mode::CreateInput(String::new()));
+    }
+
+    #[test]
+    fn process_input_create_rejects_spaces() {
+        let mut m = Model::new(vec![mk("a")]);
+        let mut p = InputParser::new();
+        assert_eq!(process_input(b"n", &mut m, &mut p), None);
+        assert_eq!(
+            process_input(b"a b\r", &mut m, &mut p),
+            Some(LoopAction::Attach("ab".into()))
+        );
+    }
+
+    // -- process_input: kill mode --
+
+    #[test]
+    fn process_input_kill_confirm() {
+        let mut m = Model::new(vec![mk("a"), mk("b")]);
+        let mut p = InputParser::new();
+        assert_eq!(process_input(b"k", &mut m, &mut p), None);
+        assert_eq!(m.mode, Mode::ConfirmKill);
+        assert_eq!(process_input(b"y", &mut m, &mut p), Some(LoopAction::Kill("a".into())));
+        assert_eq!(m.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn process_input_kill_cancel() {
+        let mut m = Model::new(vec![mk("a")]);
+        let mut p = InputParser::new();
+        assert_eq!(process_input(b"k", &mut m, &mut p), None);
+        assert_eq!(process_input(b"x", &mut m, &mut p), None);
+        assert_eq!(m.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn process_input_kill_empty_list() {
+        let mut m = Model::new(vec![]);
+        let mut p = InputParser::new();
+        assert_eq!(process_input(b"k", &mut m, &mut p), None);
+        assert_eq!(m.mode, Mode::Normal);
     }
 }
