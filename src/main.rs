@@ -93,6 +93,22 @@ fn run_tui(mut model: Model) -> Result<()> {
                     model.set_error(format!("shpool attach {name} failed"));
                 }
             }
+            LoopAction::Create(name) => {
+                // No existence pre-flight: the session doesn't exist
+                // yet — that's the whole point. `shpool attach` on an
+                // unknown name creates and attaches.
+                let status = Command::new("shpool")
+                    .args(["attach", &name])
+                    .status()
+                    .context("spawning `shpool attach`")?;
+                refresh_sessions(&mut model);
+                if let Some(i) = model.sessions.iter().position(|s| s.name == name) {
+                    model.selected = i;
+                }
+                if !status.success() {
+                    model.set_error(format!("shpool attach {name} failed"));
+                }
+            }
             LoopAction::Kill(name) => {
                 refresh_sessions(&mut model);
                 if !model.sessions.iter().any(|s| s.name == name) {

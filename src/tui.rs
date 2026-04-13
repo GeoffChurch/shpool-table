@@ -16,11 +16,35 @@ pub struct Model {
     /// Transient error message displayed in the bottom bar until the
     /// next keypress. Set by failed shell-outs and pre-flight checks.
     pub error: Option<String>,
+    /// Escape-sequence parser state used while in CreateInput mode so
+    /// that CSI sequences (arrow keys, focus events, bracketed-paste
+    /// markers, etc.) are silently consumed instead of being read as
+    /// a bare ESC cancel. Persists across reads to handle sequences
+    /// split across kernel read boundaries.
+    create_esc: CreateEscState,
+}
+
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
+enum CreateEscState {
+    #[default]
+    Normal,
+    /// Saw `\x1b` — next byte decides whether it's a sequence (`[`)
+    /// or a 2-byte ESC form.
+    Esc,
+    /// Saw `\x1b [` — consuming CSI param/intermediate bytes until a
+    /// final byte in the 0x40..=0x7e range terminates the sequence.
+    EscBracket,
 }
 
 impl Model {
     pub fn new(sessions: Vec<Session>) -> Self {
-        Self { sessions, selected: 0, mode: Mode::Normal, error: None }
+        Self {
+            sessions,
+            selected: 0,
+            mode: Mode::Normal,
+            error: None,
+            create_esc: CreateEscState::Normal,
+        }
     }
 
     pub fn set_error(&mut self, msg: impl Into<String>) {
@@ -76,6 +100,10 @@ pub enum Key {
 #[derive(Debug, PartialEq)]
 pub enum LoopAction {
     Attach(String),
+    /// Create (via `shpool attach <new-name>`) and immediately attach.
+    /// Distinct from Attach so the main loop can skip the
+    /// session-must-exist pre-flight check.
+    Create(String),
     Kill(String),
     Quit,
 }
@@ -233,6 +261,7 @@ fn process_normal(
             }
             Some(Key::NewSession) => {
                 model.mode = Mode::CreateInput(String::new());
+                model.create_esc = CreateEscState::Normal;
                 return None;
             }
             Some(Key::KillSession) => {
@@ -250,33 +279,67 @@ fn process_normal(
 
 fn process_create_input(buf: &[u8], model: &mut Model) -> Option<LoopAction> {
     for &b in buf {
-        match b {
-            0x0d | 0x0a => {
-                if let Mode::CreateInput(ref name) = model.mode {
-                    if !name.is_empty() {
-                        let name = name.clone();
-                        model.mode = Mode::Normal;
-                        return Some(LoopAction::Attach(name));
+        match model.create_esc {
+            CreateEscState::Normal => match b {
+                0x1b => {
+                    // Possibly a bare ESC (cancel) or possibly the
+                    // start of a CSI sequence. Wait for the next byte
+                    // or the end of the buffer to decide.
+                    model.create_esc = CreateEscState::Esc;
+                }
+                0x03 => {
+                    model.mode = Mode::Normal;
+                    return None;
+                }
+                0x0d | 0x0a => {
+                    if let Mode::CreateInput(ref name) = model.mode {
+                        if !name.is_empty() {
+                            let name = name.clone();
+                            model.mode = Mode::Normal;
+                            return Some(LoopAction::Create(name));
+                        }
                     }
                 }
+                0x7f | 0x08 => {
+                    if let Mode::CreateInput(ref mut name) = model.mode {
+                        name.pop();
+                    }
+                }
+                // Printable non-space ASCII (shpool rejects whitespace in names).
+                0x21..=0x7e => {
+                    if let Mode::CreateInput(ref mut name) = model.mode {
+                        name.push(b as char);
+                    }
+                }
+                _ => {}
+            },
+            CreateEscState::Esc => {
+                // Second byte of an ESC-prefixed sequence. `[` starts
+                // a CSI and we consume further bytes; anything else is
+                // a 2-byte sequence we silently drop.
+                model.create_esc = if b == b'[' {
+                    CreateEscState::EscBracket
+                } else {
+                    CreateEscState::Normal
+                };
             }
-            0x1b | 0x03 => {
-                model.mode = Mode::Normal;
-                return None;
-            }
-            0x7f | 0x08 => {
-                if let Mode::CreateInput(ref mut name) = model.mode {
-                    name.pop();
+            CreateEscState::EscBracket => {
+                // CSI: keep consuming param (0x30..=0x3f) and
+                // intermediate (0x20..=0x2f) bytes until a final byte
+                // (0x40..=0x7e) terminates the sequence.
+                if (0x40..=0x7e).contains(&b) {
+                    model.create_esc = CreateEscState::Normal;
                 }
             }
-            // Printable non-space ASCII (shpool rejects whitespace in names).
-            b if (0x21..=0x7e).contains(&b) => {
-                if let Mode::CreateInput(ref mut name) = model.mode {
-                    name.push(b as char);
-                }
-            }
-            _ => {}
         }
+    }
+    // If the buffer ended while we were still in Esc state, the user
+    // most likely pressed the Escape key on its own — sequences
+    // normally arrive as a single read, so an unterminated ESC at a
+    // read boundary is a reliable bare-Escape signal. Treat as cancel.
+    if matches!(model.create_esc, CreateEscState::Esc) {
+        model.create_esc = CreateEscState::Normal;
+        model.mode = Mode::Normal;
     }
     None
 }
@@ -658,7 +721,7 @@ mod tests {
         assert_eq!(m.mode, Mode::CreateInput(String::new()));
         assert_eq!(
             process_input(b"foo\r", &mut m, &mut p),
-            Some(LoopAction::Attach("foo".into()))
+            Some(LoopAction::Create("foo".into()))
         );
         assert_eq!(m.mode, Mode::Normal);
     }
@@ -679,7 +742,7 @@ mod tests {
         assert_eq!(process_input(b"n", &mut m, &mut p), None);
         assert_eq!(
             process_input(b"ab\x7fc\r", &mut m, &mut p),
-            Some(LoopAction::Attach("ac".into()))
+            Some(LoopAction::Create("ac".into()))
         );
     }
 
@@ -699,7 +762,7 @@ mod tests {
         assert_eq!(process_input(b"n", &mut m, &mut p), None);
         assert_eq!(
             process_input(b"a b\r", &mut m, &mut p),
-            Some(LoopAction::Attach("ab".into()))
+            Some(LoopAction::Create("ab".into()))
         );
     }
 
