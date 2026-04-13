@@ -63,37 +63,57 @@ pub enum LoopAction {
 
 // -- Key binding tables --
 //
-// These tables are the single source of truth for both the parser's
-// key dispatch and the footer text rendered in each mode. Bindings
-// come in two flavors:
-//
-//   Trigger::Byte(byte, key) — a single byte that the parser matches
-//       via table lookup in its Normal state. Adding an entry here
-//       automatically wires up both the parser and the footer.
-//
-//   Trigger::BuiltIn — a multi-byte escape sequence (e.g., arrow keys)
-//       or a key with multiple trigger bytes (e.g., Enter = CR or LF).
-//       These are matched by hardcoded logic in the parser's state
-//       machine, but listed here so the footer is generated from the
-//       same source.
+// This table is the single source of truth for both the parser's key
+// dispatch and the footer text rendered in each mode. Each Binding is
+// one footer row (label + description) plus a list of (trigger, key)
+// mappings the parser dispatches from. A single binding can fan out
+// to multiple keys (e.g., navigation maps ↑/k → Up and ↓/j → Down).
 
+#[derive(Clone, Copy)]
 pub enum Trigger {
-    Byte(u8, Key),
-    BuiltIn,
+    /// A single byte matched in the parser's Normal state.
+    Byte(u8),
+    /// An ESC [ <byte> sequence (e.g., arrow keys).
+    EscBracket(u8),
 }
 
 pub struct Binding {
-    pub trigger: Trigger,
     pub label: &'static str,
     pub description: &'static str,
+    pub mappings: &'static [(Trigger, Key)],
 }
 
 pub const NORMAL_BINDINGS: &[Binding] = &[
-    Binding { trigger: Trigger::BuiltIn, label: "up/down", description: "navigate" },
-    Binding { trigger: Trigger::BuiltIn, label: "enter", description: "attach" },
-    Binding { trigger: Trigger::Byte(b'n', Key::NewSession), label: "n", description: "new" },
-    Binding { trigger: Trigger::Byte(b'k', Key::KillSession), label: "k", description: "kill" },
-    Binding { trigger: Trigger::Byte(b'q', Key::Quit), label: "q", description: "quit" },
+    Binding {
+        label: "↑↓/kj",
+        description: "navigate",
+        mappings: &[
+            (Trigger::EscBracket(b'A'), Key::Up),
+            (Trigger::EscBracket(b'B'), Key::Down),
+            (Trigger::Byte(b'k'), Key::Up),
+            (Trigger::Byte(b'j'), Key::Down),
+        ],
+    },
+    Binding {
+        label: "enter",
+        description: "attach",
+        mappings: &[(Trigger::Byte(b'\r'), Key::Enter), (Trigger::Byte(b'\n'), Key::Enter)],
+    },
+    Binding {
+        label: "n",
+        description: "new",
+        mappings: &[(Trigger::Byte(b'n'), Key::NewSession)],
+    },
+    Binding {
+        label: "d",
+        description: "kill",
+        mappings: &[(Trigger::Byte(b'd'), Key::KillSession)],
+    },
+    Binding {
+        label: "q",
+        description: "quit",
+        mappings: &[(Trigger::Byte(b'q'), Key::Quit), (Trigger::Byte(0x03), Key::Quit)],
+    },
 ];
 
 /// Footer hints for create mode. The actual byte handling lives in
@@ -124,24 +144,11 @@ impl InputParser {
     pub fn feed(&mut self, byte: u8) -> Option<Key> {
         match self.state {
             ParserState::Normal => {
-                // Table-driven dispatch for single-byte bindings.
-                for binding in NORMAL_BINDINGS {
-                    if let Trigger::Byte(b, key) = binding.trigger {
-                        if byte == b {
-                            return Some(key);
-                        }
-                    }
+                if byte == 0x1b {
+                    self.state = ParserState::Esc;
+                    return None;
                 }
-                // Built-in keys: multi-byte sequences and control chars.
-                match byte {
-                    b'\r' | b'\n' => Some(Key::Enter),
-                    0x03 => Some(Key::Quit),
-                    0x1b => {
-                        self.state = ParserState::Esc;
-                        None
-                    }
-                    _ => Some(Key::Other),
-                }
+                Some(lookup(|t| matches!(t, Trigger::Byte(b) if b == byte)).unwrap_or(Key::Other))
             }
             ParserState::Esc => match byte {
                 b'[' => {
@@ -155,14 +162,24 @@ impl InputParser {
             },
             ParserState::EscBracket => {
                 self.state = ParserState::Normal;
-                match byte {
-                    b'A' => Some(Key::Up),
-                    b'B' => Some(Key::Down),
-                    _ => Some(Key::Other),
-                }
+                Some(
+                    lookup(|t| matches!(t, Trigger::EscBracket(b) if b == byte))
+                        .unwrap_or(Key::Other),
+                )
             }
         }
     }
+}
+
+fn lookup(matches: impl Fn(Trigger) -> bool) -> Option<Key> {
+    for binding in NORMAL_BINDINGS {
+        for (trig, key) in binding.mappings {
+            if matches(*trig) {
+                return Some(*key);
+            }
+        }
+    }
+    None
 }
 
 // -- Input processing --
@@ -425,7 +442,14 @@ mod tests {
     #[test]
     fn parser_kill_session() {
         let mut p = InputParser::new();
-        assert_eq!(p.feed(b'k'), Some(Key::KillSession));
+        assert_eq!(p.feed(b'd'), Some(Key::KillSession));
+    }
+
+    #[test]
+    fn parser_vim_navigation() {
+        let mut p = InputParser::new();
+        assert_eq!(p.feed(b'j'), Some(Key::Down));
+        assert_eq!(p.feed(b'k'), Some(Key::Up));
     }
 
     #[test]
@@ -555,7 +579,7 @@ mod tests {
     fn process_input_kill_confirm() {
         let mut m = Model::new(vec![mk("a"), mk("b")]);
         let mut p = InputParser::new();
-        assert_eq!(process_input(b"k", &mut m, &mut p), None);
+        assert_eq!(process_input(b"d", &mut m, &mut p), None);
         assert_eq!(m.mode, Mode::ConfirmKill("a".into()));
         assert_eq!(process_input(b"y", &mut m, &mut p), Some(LoopAction::Kill("a".into())));
         assert_eq!(m.mode, Mode::Normal);
@@ -565,7 +589,7 @@ mod tests {
     fn process_input_kill_cancel() {
         let mut m = Model::new(vec![mk("a")]);
         let mut p = InputParser::new();
-        assert_eq!(process_input(b"k", &mut m, &mut p), None);
+        assert_eq!(process_input(b"d", &mut m, &mut p), None);
         assert_eq!(process_input(b"x", &mut m, &mut p), None);
         assert_eq!(m.mode, Mode::Normal);
     }
@@ -574,8 +598,15 @@ mod tests {
     fn process_input_kill_empty_list() {
         let mut m = Model::new(vec![]);
         let mut p = InputParser::new();
-        assert_eq!(process_input(b"k", &mut m, &mut p), None);
+        assert_eq!(process_input(b"d", &mut m, &mut p), None);
         assert_eq!(m.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn process_input_vim_navigate_and_attach() {
+        let mut m = Model::new(vec![mk("a"), mk("b"), mk("c")]);
+        let mut p = InputParser::new();
+        assert_eq!(process_input(b"jj\r", &mut m, &mut p), Some(LoopAction::Attach("c".into())));
     }
 
     // -- Viewport --
