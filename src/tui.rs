@@ -13,11 +13,18 @@ pub struct Model {
     pub sessions: Vec<Session>,
     pub selected: usize,
     pub mode: Mode,
+    /// Transient error message displayed in the bottom bar until the
+    /// next keypress. Set by failed shell-outs and pre-flight checks.
+    pub error: Option<String>,
 }
 
 impl Model {
     pub fn new(sessions: Vec<Session>) -> Self {
-        Self { sessions, selected: 0, mode: Mode::Normal }
+        Self { sessions, selected: 0, mode: Mode::Normal, error: None }
+    }
+
+    pub fn set_error(&mut self, msg: impl Into<String>) {
+        self.error = Some(msg.into());
     }
 
     pub fn select_next(&mut self) {
@@ -201,6 +208,8 @@ pub fn process_input(
     model: &mut Model,
     parser: &mut InputParser,
 ) -> Option<LoopAction> {
+    // Any keypress dismisses a pending error — the user has now seen it.
+    model.error = None;
     match model.mode {
         Mode::Normal => process_normal(buf, model, parser),
         Mode::CreateInput(_) => process_create_input(buf, model),
@@ -297,6 +306,7 @@ const SGR_BAR_BG: &str = "\x1b[48;5;236m"; // dark gray bar background (#303030)
 const SGR_BAR_END: &str = "\x1b[49m"; // restore default bg, keep fg
 const SGR_AMBER: &str = "\x1b[1;38;2;255;200;87m"; // bold warm amber (#ffc857)
 const SGR_AMBER_DIM: &str = "\x1b[38;2;200;156;82m"; // dim warm amber (#c89c52)
+const SGR_ERROR: &str = "\x1b[1;38;2;255;120;100m"; // bold warm red (#ff7864)
 // Reset only fg + bold inside a bar — leaves the bar background intact.
 const SGR_BAR_FG_RESET: &str = "\x1b[22;39m";
 const SGR_SELECTED: &str = "\x1b[7m"; // reverse video
@@ -320,6 +330,13 @@ impl Label {
 
     fn push_key(&mut self, s: &str) {
         self.styled.push_str(SGR_AMBER);
+        self.styled.push_str(s);
+        self.styled.push_str(SGR_BAR_FG_RESET);
+        self.visible += s.chars().count();
+    }
+
+    fn push_error(&mut self, s: &str) {
+        self.styled.push_str(SGR_ERROR);
         self.styled.push_str(s);
         self.styled.push_str(SGR_BAR_FG_RESET);
         self.visible += s.chars().count();
@@ -354,6 +371,13 @@ fn create_input_label(input: &str) -> Label {
     l.push_plain("_   (");
     push_hints(&mut l, CREATE_HINTS);
     l.push_plain(")");
+    l
+}
+
+fn error_label(msg: &str) -> Label {
+    let mut l = Label::default();
+    l.push_error("! ");
+    l.push_error(msg);
     l
 }
 
@@ -432,10 +456,14 @@ pub fn render(
         }
     }
 
-    let bottom = match &model.mode {
-        Mode::Normal => normal_bindings_label(),
-        Mode::CreateInput(input) => create_input_label(input),
-        Mode::ConfirmKill(name) => confirm_kill_label(name),
+    let bottom = if let Some(err) = &model.error {
+        error_label(err)
+    } else {
+        match &model.mode {
+            Mode::Normal => normal_bindings_label(),
+            Mode::CreateInput(input) => create_input_label(input),
+            Mode::ConfirmKill(name) => confirm_kill_label(name),
+        }
     };
     render_bar(out, w, &bottom)?;
 
@@ -457,7 +485,8 @@ fn viewport(total: usize, selected: usize, max_visible: usize) -> (usize, usize)
 mod tests {
     use super::*;
     fn mk(name: &str) -> Session {
-        Session { name: name.to_string() }
+        use crate::session::SessionStatus;
+        Session { name: name.to_string(), status: SessionStatus::Disconnected }
     }
 
     // -- Model tests --
@@ -600,6 +629,16 @@ mod tests {
         let mut m = Model::new(vec![]);
         let mut p = InputParser::new();
         assert_eq!(process_input(b"\r", &mut m, &mut p), None);
+    }
+
+    #[test]
+    fn process_input_clears_error() {
+        let mut m = Model::new(vec![mk("a")]);
+        let mut p = InputParser::new();
+        m.set_error("session 'a' is gone");
+        assert!(m.error.is_some());
+        process_input(b"j", &mut m, &mut p);
+        assert!(m.error.is_none());
     }
 
     #[test]

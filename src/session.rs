@@ -8,6 +8,21 @@ pub struct ListReply {
 #[derive(Debug, Deserialize)]
 pub struct Session {
     pub name: String,
+    pub status: SessionStatus,
+}
+
+/// The status reported by `shpool list --json`. We don't display it
+/// (shpool's daemon takes up to ~1s to mark a session Disconnected
+/// after detach, so the label would flash stale), but we do use
+/// `Attached` in the pre-flight check to refuse re-attaching a
+/// session that shpool would reject with "already has a terminal
+/// attached" (which shpool reports on stderr with exit 0).
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub enum SessionStatus {
+    Attached,
+    Disconnected,
+    #[serde(other)]
+    Unknown,
 }
 
 #[cfg(test)]
@@ -25,7 +40,18 @@ mod tests {
         let reply: ListReply = serde_json::from_str(json).unwrap();
         assert_eq!(reply.sessions.len(), 2);
         assert_eq!(reply.sessions[0].name, "main");
+        assert_eq!(reply.sessions[0].status, SessionStatus::Attached);
         assert_eq!(reply.sessions[1].name, "build");
+        assert_eq!(reply.sessions[1].status, SessionStatus::Disconnected);
+    }
+
+    #[test]
+    fn parse_unknown_status() {
+        let json = r#"{
+            "sessions": [{"name": "x", "started_at_unix_ms": 0, "status": "Frozen"}]
+        }"#;
+        let reply: ListReply = serde_json::from_str(json).unwrap();
+        assert_eq!(reply.sessions[0].status, SessionStatus::Unknown);
     }
 
     #[test]
