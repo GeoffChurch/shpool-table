@@ -83,6 +83,12 @@ pub fn read_stdin(buf: &mut [u8]) -> io::Result<usize> {
 pub fn enter_alt_screen(out: &mut impl Write) -> io::Result<()> {
     out.write_all(b"\x1b[?1049h")?;
     out.write_all(b"\x1b[?25l")?;
+    // DECCKM off: force normal cursor-key mode so arrows send
+    // `ESC [ A/B` (which our parser understands) rather than the
+    // application-mode `ESC O A/B`. Emacs and some other TUIs
+    // leave DECCKM on; a mid-session detach never gives them a
+    // chance to restore it, so we set the state ourselves.
+    out.write_all(b"\x1b[?1l")?;
     Ok(())
 }
 
