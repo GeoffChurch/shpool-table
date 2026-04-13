@@ -382,8 +382,8 @@ fn process_confirm_kill(buf: &[u8], model: &mut Model) -> Option<LoopAction> {
 const SGR_RESET: &str = "\x1b[0m";
 const SGR_BAR_BG: &str = "\x1b[48;5;236m"; // dark gray bar background (#303030)
 const SGR_BAR_END: &str = "\x1b[49m"; // restore default bg, keep fg
-const SGR_AMBER: &str = "\x1b[1;38;2;255;200;87m"; // bold warm amber (#ffc857)
-const SGR_AMBER_DIM: &str = "\x1b[38;2;200;156;82m"; // dim warm amber (#c89c52)
+const SGR_AMBER: &str = "\x1b[1;38;2;235;185;90m"; // bold warm amber (#ebb95a)
+const SGR_AMBER_DIM: &str = "\x1b[38;2;130;105;75m"; // muted warm amber (#82694b)
 const SGR_ERROR: &str = "\x1b[1;38;2;255;120;100m"; // bold warm red (#ff7864)
 // Reset only fg + bold inside a bar — leaves the bar background intact.
 const SGR_BAR_FG_RESET: &str = "\x1b[22;39m";
@@ -433,7 +433,7 @@ fn normal_bindings_label() -> Label {
     let mut l = Label::default();
     for (i, b) in NORMAL_BINDINGS.iter().enumerate() {
         if i > 0 {
-            l.push_plain(" · ");
+            l.push_plain("   ");
         }
         l.push_key(b.label);
         l.push_plain(" ");
