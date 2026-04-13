@@ -75,8 +75,10 @@ impl Model {
 
     /// Replace the session list, preserving the selection by name when
     /// possible and otherwise clamping the previous index into the new
-    /// list. Used by the event loop to absorb external changes.
-    pub fn refresh(&mut self, new_sessions: Vec<Session>) {
+    /// list. Sessions are sorted with the most recently active first,
+    /// so whichever session you last touched floats to the top.
+    pub fn refresh(&mut self, mut new_sessions: Vec<Session>) {
+        new_sessions.sort_by_key(|s| std::cmp::Reverse(s.last_active_unix_ms()));
         let prev_name = self.selected_name().map(str::to_string);
         let prev_idx = self.selected;
         self.sessions = new_sessions;
@@ -132,17 +134,23 @@ pub struct Binding {
 
 pub const NORMAL_BINDINGS: &[Binding] = &[
     Binding {
-        label: "↑↓/kj",
-        description: "navigate",
+        label: "j",
+        description: "down",
         mappings: &[
-            (Trigger::EscBracket(b'A'), Key::Up),
             (Trigger::EscBracket(b'B'), Key::Down),
-            (Trigger::Byte(b'k'), Key::Up),
             (Trigger::Byte(b'j'), Key::Down),
         ],
     },
     Binding {
-        label: "enter",
+        label: "k",
+        description: "up",
+        mappings: &[
+            (Trigger::EscBracket(b'A'), Key::Up),
+            (Trigger::Byte(b'k'), Key::Up),
+        ],
+    },
+    Binding {
+        label: "ret",
         description: "attach",
         mappings: &[(Trigger::Byte(b'\r'), Key::Enter), (Trigger::Byte(b'\n'), Key::Enter)],
     },
@@ -165,7 +173,7 @@ pub const NORMAL_BINDINGS: &[Binding] = &[
 
 /// Footer hints for create mode. The actual byte handling lives in
 /// process_create_input; these just keep the display in sync.
-pub const CREATE_HINTS: &[(&str, &str)] = &[("enter", "create"), ("esc", "cancel")];
+pub const CREATE_HINTS: &[(&str, &str)] = &[("ret", "create"), ("esc", "cancel")];
 pub const CONFIRM_KILL_HINTS: &[(&str, &str)] = &[("y", "confirm"), ("n", "cancel")];
 
 // -- Input parser --
@@ -500,11 +508,17 @@ fn render_bar(
             (lead, trail)
         }
     };
+    // Clip the styled label to whatever visible space is left after
+    // the leading pad. For labels that already fit this is a no-op;
+    // for over-long labels this drops the tail so nothing bleeds
+    // onto or clobbers the right margin.
+    let available = width.saturating_sub(lead);
+    let clipped = clip_styled(&label.styled, available);
     out.write_all(SGR_BAR_BG.as_bytes())?;
     for _ in 0..lead {
         out.write_all(b" ")?;
     }
-    out.write_all(label.styled.as_bytes())?;
+    out.write_all(clipped.as_bytes())?;
     for _ in 0..trail {
         out.write_all(b" ")?;
     }
@@ -514,6 +528,15 @@ fn render_bar(
     Ok(())
 }
 
+// Top bar + table header + bottom bar = 3 lines of overhead.
+const CHROME_LINES: usize = 3;
+
+// Column widths sized to their headers. Short relative-age values
+// ("now", "42s", "13m", "4h", "9d") never exceed the header width.
+const COL_CREATED: &str = "created";
+const COL_ACTIVE: &str = "active";
+const COL_GAP: usize = 2;
+
 /// Clip a string to at most `max_chars` characters. Used on row
 /// content so rows longer than the terminal width are truncated
 /// rather than wrapped or clobbering the rightmost column.
@@ -521,8 +544,71 @@ fn clip(s: &str, max_chars: usize) -> String {
     s.chars().take(max_chars).collect()
 }
 
-// Top bar + bottom bar = 2 lines of overhead.
-const CHROME_LINES: usize = 2;
+/// Clip a styled string (ANSI + text) so the visible character count
+/// does not exceed `max_visible`. ANSI CSI escape sequences
+/// (`\x1b[...<final>`) are passed through verbatim — they don't
+/// consume visible columns, but they stay attached to the text
+/// they were styling.
+fn clip_styled(styled: &str, max_visible: usize) -> String {
+    let mut out = String::new();
+    let mut visible = 0usize;
+    // 0 = normal, 1 = just saw ESC, 2 = inside CSI (past `[`, reading
+    // params/intermediates until a final byte in 0x40..=0x7e).
+    let mut esc = 0u8;
+    for ch in styled.chars() {
+        match esc {
+            0 => {
+                if ch == '\x1b' {
+                    out.push(ch);
+                    esc = 1;
+                } else {
+                    if visible >= max_visible {
+                        break;
+                    }
+                    out.push(ch);
+                    visible += 1;
+                }
+            }
+            1 => {
+                out.push(ch);
+                esc = if ch == '[' { 2 } else { 0 };
+            }
+            _ => {
+                out.push(ch);
+                if matches!(ch as u32, 0x40..=0x7e) {
+                    esc = 0;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn now_unix_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+/// Render a unix-ms timestamp as a short relative-to-now string:
+/// "now" for the first 5 seconds, then "Ns", "Nm", "Nh", "Nd".
+fn format_age(now_ms: u64, then_ms: u64) -> String {
+    let secs = now_ms.saturating_sub(then_ms) / 1000;
+    if secs < 5 {
+        return "now".to_string();
+    }
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{mins}m");
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return format!("{hours}h");
+    }
+    format!("{}d", hours / 24)
+}
 
 pub fn render(
     model: &Model,
@@ -536,20 +622,50 @@ pub fn render(
 
     render_bar(out, w, &title_label(model), BarAlign::Center)?;
 
+    // Name column width grows to fit the longest session name, with a
+    // floor of "NAME".len() so the header never overflows.
+    let name_width = model
+        .sessions
+        .iter()
+        .map(|s| s.name.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("name".len());
+    let created_width = COL_CREATED.len();
+    let active_width = COL_ACTIVE.len();
+
+    // Header row, styled like the bindings (dim amber) to subordinate
+    // it to the list content.
+    let header = clip(
+        &format!(
+            "  {name:<name_width$}{gap}{created:<created_width$}{gap}{active:<active_width$}",
+            name = "name",
+            created = COL_CREATED,
+            active = COL_ACTIVE,
+            gap = " ".repeat(COL_GAP),
+        ),
+        w,
+    );
+    write!(out, "{SGR_BAR_BG}{SGR_AMBER_DIM}{header:<w$}{SGR_RESET}\r\n")?;
+
     if model.sessions.is_empty() {
         out.write_all(b"  (no sessions)\r\n")?;
     } else {
+        let now = now_unix_ms();
         let max_visible = (height as usize).saturating_sub(CHROME_LINES);
         let (start, end) = viewport(model.sessions.len(), model.selected, max_visible);
 
         for (i, s) in model.sessions[start..end].iter().enumerate() {
             let abs_i = start + i;
+            let prefix = if abs_i == model.selected { "> " } else { "  " };
+            let created = format_age(now, s.started_at_unix_ms);
+            let active = format_age(now, s.last_active_unix_ms());
             let text = clip(
-                &if abs_i == model.selected {
-                    format!("> {}", s.name)
-                } else {
-                    format!("  {}", s.name)
-                },
+                &format!(
+                    "{prefix}{name:<name_width$}{gap}{created:<created_width$}{gap}{active:<active_width$}",
+                    name = s.name,
+                    gap = " ".repeat(COL_GAP),
+                ),
                 w,
             );
             if abs_i == model.selected {
@@ -590,7 +706,13 @@ mod tests {
     use super::*;
     fn mk(name: &str) -> Session {
         use crate::session::SessionStatus;
-        Session { name: name.to_string(), status: SessionStatus::Disconnected }
+        Session {
+            name: name.to_string(),
+            status: SessionStatus::Disconnected,
+            started_at_unix_ms: 0,
+            last_connected_at_unix_ms: 0,
+            last_disconnected_at_unix_ms: None,
+        }
     }
 
     // -- Model tests --
