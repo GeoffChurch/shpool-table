@@ -34,13 +34,13 @@ cargo build --release
 shpool-table
 ```
 
-| Key          | Action                                    |
-|--------------|-------------------------------------------|
-| Up / Down    | Move selection                            |
-| Enter        | Attach to the selected session            |
-| n            | Create a new session (prompts for name)   |
-| k            | Kill the selected session (confirms first)|
-| q / Ctrl-C   | Quit                                      |
+| Key                | Action                                    |
+|--------------------|-------------------------------------------|
+| Up / Down or k / j | Move selection                            |
+| Enter              | Attach to the selected session            |
+| n                  | Create a new session (prompts for name)   |
+| d                  | Kill the selected session (confirms first)|
+| q / Ctrl-C         | Quit                                      |
 
 The TUI footer is the canonical source for key bindings — the table
 above is a convenience snapshot.
@@ -123,8 +123,8 @@ cargo test
 The test suite covers:
 
 - **JSON schema compatibility.** Deserializes representative `shpool
-  list --json` output (including unknown status variants and extra
-  fields) to catch serde drift without needing a running daemon.
+  list --json` output (including extra fields) to catch serde drift
+  without needing a running daemon.
 - **Selection state.** Wrap-around for up/down, empty-list edge case.
 - **Input parsing.** Escape-sequence state machine for arrow keys,
   Enter, quit keys, and unknown sequences.

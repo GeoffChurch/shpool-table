@@ -41,6 +41,18 @@ impl Model {
     pub fn selected_name(&self) -> Option<&str> {
         self.sessions.get(self.selected).map(|s| s.name.as_str())
     }
+
+    /// Replace the session list, preserving the selection by name when
+    /// possible and otherwise clamping the previous index into the new
+    /// list. Used by the event loop to absorb external changes.
+    pub fn refresh(&mut self, new_sessions: Vec<Session>) {
+        let prev_name = self.selected_name().map(str::to_string);
+        let prev_idx = self.selected;
+        self.sessions = new_sessions;
+        self.selected = prev_name
+            .and_then(|name| self.sessions.iter().position(|s| s.name == name))
+            .unwrap_or_else(|| prev_idx.min(self.sessions.len().saturating_sub(1)));
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -278,22 +290,114 @@ fn process_confirm_kill(buf: &[u8], model: &mut Model) -> Option<LoopAction> {
 
 // -- Rendering --
 
-fn render_hints(
-    out: &mut impl Write,
-    hints: impl IntoIterator<Item = (&'static str, &'static str)>,
-    separator: &str,
-) -> io::Result<()> {
-    for (i, (label, desc)) in hints.into_iter().enumerate() {
-        if i > 0 {
-            out.write_all(separator.as_bytes())?;
-        }
-        write!(out, "{label}: {desc}")?;
+// SGR codes for the bar chrome. The chrome reads as a phosphor-amber
+// CRT bezel: dark bar background with two-tone amber text on top.
+const SGR_RESET: &str = "\x1b[0m";
+const SGR_BAR_BG: &str = "\x1b[48;5;236m"; // dark gray bar background (#303030)
+const SGR_BAR_END: &str = "\x1b[49m"; // restore default bg, keep fg
+const SGR_AMBER: &str = "\x1b[1;38;2;255;200;87m"; // bold warm amber (#ffc857)
+const SGR_AMBER_DIM: &str = "\x1b[38;2;200;156;82m"; // dim warm amber (#c89c52)
+// Reset only fg + bold inside a bar — leaves the bar background intact.
+const SGR_BAR_FG_RESET: &str = "\x1b[22;39m";
+const SGR_SELECTED: &str = "\x1b[7m"; // reverse video
+
+/// A label destined for embedding in a chrome bar. Tracks the styled
+/// byte stream and the visible column count separately, so the bar's
+/// trailing space fill can be sized correctly without parsing ANSI.
+#[derive(Default)]
+struct Label {
+    styled: String,
+    visible: usize,
+}
+
+impl Label {
+    fn push_plain(&mut self, s: &str) {
+        self.styled.push_str(SGR_AMBER_DIM);
+        self.styled.push_str(s);
+        self.styled.push_str(SGR_BAR_FG_RESET);
+        self.visible += s.chars().count();
     }
+
+    fn push_key(&mut self, s: &str) {
+        self.styled.push_str(SGR_AMBER);
+        self.styled.push_str(s);
+        self.styled.push_str(SGR_BAR_FG_RESET);
+        self.visible += s.chars().count();
+    }
+}
+
+fn title_label(model: &Model) -> Label {
+    let mut l = Label::default();
+    let n = model.sessions.len();
+    let title = format!("shpool ({n} session{})", if n == 1 { "" } else { "s" });
+    l.push_key(&title);
+    l
+}
+
+fn normal_bindings_label() -> Label {
+    let mut l = Label::default();
+    for (i, b) in NORMAL_BINDINGS.iter().enumerate() {
+        if i > 0 {
+            l.push_plain(" · ");
+        }
+        l.push_key(b.label);
+        l.push_plain(" ");
+        l.push_plain(b.description);
+    }
+    l
+}
+
+fn create_input_label(input: &str) -> Label {
+    let mut l = Label::default();
+    l.push_plain("new session: ");
+    l.push_key(input);
+    l.push_plain("_   (");
+    push_hints(&mut l, CREATE_HINTS);
+    l.push_plain(")");
+    l
+}
+
+fn confirm_kill_label(name: &str) -> Label {
+    let mut l = Label::default();
+    l.push_plain("kill ");
+    l.push_key(&format!("\"{name}\""));
+    l.push_plain("?   (");
+    push_hints(&mut l, CONFIRM_KILL_HINTS);
+    l.push_plain(")");
+    l
+}
+
+fn push_hints(l: &mut Label, hints: &[(&'static str, &'static str)]) {
+    for (i, (key, desc)) in hints.iter().enumerate() {
+        if i > 0 {
+            l.push_plain(", ");
+        }
+        l.push_key(key);
+        l.push_plain(": ");
+        l.push_plain(desc);
+    }
+}
+
+/// Render a chrome bar with an embedded label, filling `width` columns
+/// with the bar background.
+fn render_bar(out: &mut impl Write, width: usize, label: &Label) -> io::Result<()> {
+    // Layout (visible columns): "  " (2) + label.visible + trailing fill
+    let used = 2 + label.visible;
+    let trail = width.saturating_sub(used);
+    out.write_all(SGR_BAR_BG.as_bytes())?;
+    out.write_all(b"  ")?;
+    out.write_all(label.styled.as_bytes())?;
+    for _ in 0..trail {
+        out.write_all(b" ")?;
+    }
+    out.write_all(SGR_BAR_END.as_bytes())?;
+    out.write_all(SGR_RESET.as_bytes())?;
+    out.write_all(b"\r\n")?;
     Ok(())
 }
 
-// Header (2 lines) + blank before footer + footer (1 line) = 4 lines of overhead.
-const CHROME_LINES: usize = 4;
+// Top bar + bottom bar = 2 lines of overhead.
+const CHROME_LINES: usize = 2;
 
 pub fn render(
     model: &Model,
@@ -305,7 +409,7 @@ pub fn render(
 
     out.write_all(b"\x1b[2J\x1b[H")?;
 
-    write!(out, "shpool sessions ({} total)\r\n\r\n", model.sessions.len())?;
+    render_bar(out, w, &title_label(model))?;
 
     if model.sessions.is_empty() {
         out.write_all(b"  (no sessions)\r\n")?;
@@ -316,35 +420,24 @@ pub fn render(
         for (i, s) in model.sessions[start..end].iter().enumerate() {
             let abs_i = start + i;
             let text = if abs_i == model.selected {
-                format!("> {}  [{}]", s.name, s.status.as_str())
+                format!("> {}", s.name)
             } else {
-                format!("  {}  [{}]", s.name, s.status.as_str())
+                format!("  {}", s.name)
             };
             if abs_i == model.selected {
-                write!(out, "\x1b[7m{text:<w$}\x1b[0m\r\n")?;
+                write!(out, "{SGR_SELECTED}{text:<w$}{SGR_RESET}\r\n")?;
             } else {
                 write!(out, "{text:<w$}\r\n")?;
             }
         }
     }
 
-    match &model.mode {
-        Mode::Normal => {
-            out.write_all(b"\r\n")?;
-            render_hints(out, NORMAL_BINDINGS.iter().map(|b| (b.label, b.description)), "   ")?;
-            out.write_all(b"\r\n")?;
-        }
-        Mode::CreateInput(input) => {
-            write!(out, "\r\nnew session: {input}_   (")?;
-            render_hints(out, CREATE_HINTS.iter().copied(), ", ")?;
-            out.write_all(b")\r\n")?;
-        }
-        Mode::ConfirmKill(name) => {
-            write!(out, "\r\nkill \"{name}\"? (")?;
-            render_hints(out, CONFIRM_KILL_HINTS.iter().copied(), ", ")?;
-            out.write_all(b")\r\n")?;
-        }
-    }
+    let bottom = match &model.mode {
+        Mode::Normal => normal_bindings_label(),
+        Mode::CreateInput(input) => create_input_label(input),
+        Mode::ConfirmKill(name) => confirm_kill_label(name),
+    };
+    render_bar(out, w, &bottom)?;
 
     Ok(())
 }
@@ -363,10 +456,8 @@ fn viewport(total: usize, selected: usize, max_visible: usize) -> (usize, usize)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::SessionStatus;
-
     fn mk(name: &str) -> Session {
-        Session { name: name.to_string(), status: SessionStatus::Disconnected }
+        Session { name: name.to_string() }
     }
 
     // -- Model tests --
