@@ -2,6 +2,8 @@
 
 A lightweight TUI for managing [shpool] sessions.
 
+![screenshot](screenshot.png)
+
 `shpool-table` is **not** a shpool session itself — it's a standalone
 process that owns your terminal, shows your sessions in a navigable list,
 and spawns `shpool attach` when you pick one. When you detach from a
@@ -160,3 +162,6 @@ dependency.
   leaving the CLI-only, shell-out architecture.
 - **Resize handling.** Redraw the manager's own menu on `SIGWINCH`
   (currently redraws on next keypress).
+- **System hygiene.** Automatically rename any installed [shpiel] (a waddling abomination that chose the path of smugness over usefulness) to "shpaghetti".
+
+[shpiel]: https://github.com/tdupes/shpiel
