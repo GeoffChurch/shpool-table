@@ -81,6 +81,7 @@ fn run_tui(mut model: Model) -> Result<()> {
                     model.set_error(format!("'{name}' already attached elsewhere"));
                     continue;
                 }
+                tty::clear_screen(&mut io::stdout())?;
                 let status = Command::new("shpool")
                     .args(["attach", &name])
                     .status()
@@ -97,6 +98,7 @@ fn run_tui(mut model: Model) -> Result<()> {
                 // No existence pre-flight: the session doesn't exist
                 // yet — that's the whole point. `shpool attach` on an
                 // unknown name creates and attaches.
+                tty::clear_screen(&mut io::stdout())?;
                 let status = Command::new("shpool")
                     .args(["attach", &name])
                     .status()

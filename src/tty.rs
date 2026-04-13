@@ -89,11 +89,27 @@ pub fn enter_alt_screen(out: &mut impl Write) -> io::Result<()> {
     // leave DECCKM on; a mid-session detach never gives them a
     // chance to restore it, so we set the state ourselves.
     out.write_all(b"\x1b[?1l")?;
+    // DECAWM off: disable auto-wrap at the right margin. We clip
+    // rows to width in the renderer too, but this is a defensive
+    // layer — any off-by-one in our width accounting gets
+    // absorbed at the margin instead of breaking the layout.
+    out.write_all(b"\x1b[?7l")?;
     Ok(())
 }
 
 pub fn leave_alt_screen(out: &mut impl Write) -> io::Result<()> {
     out.write_all(b"\x1b[?25h")?;
+    // DECAWM back on so the user's shell behaves normally afterward.
+    out.write_all(b"\x1b[?7h")?;
     out.write_all(b"\x1b[?1049l")?;
     Ok(())
+}
+
+/// Clear the visible screen and home the cursor. Used right before
+/// handing the terminal to `shpool attach` so the user's pre-launch
+/// shell history doesn't flash behind the child process while it
+/// boots. Scrollback is preserved (`\x1b[3J` would wipe it too).
+pub fn clear_screen(out: &mut impl Write) -> io::Result<()> {
+    out.write_all(b"\x1b[2J\x1b[H")?;
+    out.flush()
 }

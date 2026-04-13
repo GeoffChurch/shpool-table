@@ -195,7 +195,14 @@ impl InputParser {
                     self.state = ParserState::Esc;
                     return None;
                 }
-                Some(lookup(|t| matches!(t, Trigger::Byte(b) if b == byte)).unwrap_or(Key::Other))
+                // Fold uppercase ASCII to lowercase so bindings match
+                // `N`/`J`/etc. as well as `n`/`j`. Tradeoff: uppercase
+                // variants can no longer carry a distinct meaning.
+                let normalized = byte.to_ascii_lowercase();
+                Some(
+                    lookup(|t| matches!(t, Trigger::Byte(b) if b == normalized))
+                        .unwrap_or(Key::Other),
+                )
             }
             ParserState::Esc => match byte {
                 b'[' => {
@@ -465,14 +472,38 @@ fn push_hints(l: &mut Label, hints: &[(&'static str, &'static str)]) {
     }
 }
 
+#[derive(Clone, Copy)]
+enum BarAlign {
+    Left,
+    Center,
+}
+
 /// Render a chrome bar with an embedded label, filling `width` columns
-/// with the bar background.
-fn render_bar(out: &mut impl Write, width: usize, label: &Label) -> io::Result<()> {
-    // Layout (visible columns): "  " (2) + label.visible + trailing fill
-    let used = 2 + label.visible;
-    let trail = width.saturating_sub(used);
+/// with the bar background. Left-aligned bars get a 2-col leading
+/// pad; centered bars split the remaining space evenly.
+fn render_bar(
+    out: &mut impl Write,
+    width: usize,
+    label: &Label,
+    align: BarAlign,
+) -> io::Result<()> {
+    let (lead, trail) = match align {
+        BarAlign::Left => {
+            let lead = 2;
+            let trail = width.saturating_sub(lead + label.visible);
+            (lead, trail)
+        }
+        BarAlign::Center => {
+            let slack = width.saturating_sub(label.visible);
+            let lead = slack / 2;
+            let trail = slack - lead;
+            (lead, trail)
+        }
+    };
     out.write_all(SGR_BAR_BG.as_bytes())?;
-    out.write_all(b"  ")?;
+    for _ in 0..lead {
+        out.write_all(b" ")?;
+    }
     out.write_all(label.styled.as_bytes())?;
     for _ in 0..trail {
         out.write_all(b" ")?;
@@ -481,6 +512,13 @@ fn render_bar(out: &mut impl Write, width: usize, label: &Label) -> io::Result<(
     out.write_all(SGR_RESET.as_bytes())?;
     out.write_all(b"\r\n")?;
     Ok(())
+}
+
+/// Clip a string to at most `max_chars` characters. Used on row
+/// content so rows longer than the terminal width are truncated
+/// rather than wrapped or clobbering the rightmost column.
+fn clip(s: &str, max_chars: usize) -> String {
+    s.chars().take(max_chars).collect()
 }
 
 // Top bar + bottom bar = 2 lines of overhead.
@@ -496,7 +534,7 @@ pub fn render(
 
     out.write_all(b"\x1b[2J\x1b[H")?;
 
-    render_bar(out, w, &title_label(model))?;
+    render_bar(out, w, &title_label(model), BarAlign::Center)?;
 
     if model.sessions.is_empty() {
         out.write_all(b"  (no sessions)\r\n")?;
@@ -506,11 +544,14 @@ pub fn render(
 
         for (i, s) in model.sessions[start..end].iter().enumerate() {
             let abs_i = start + i;
-            let text = if abs_i == model.selected {
-                format!("> {}", s.name)
-            } else {
-                format!("  {}", s.name)
-            };
+            let text = clip(
+                &if abs_i == model.selected {
+                    format!("> {}", s.name)
+                } else {
+                    format!("  {}", s.name)
+                },
+                w,
+            );
             if abs_i == model.selected {
                 write!(out, "{SGR_SELECTED}{text:<w$}{SGR_RESET}\r\n")?;
             } else {
@@ -528,7 +569,7 @@ pub fn render(
             Mode::ConfirmKill(name) => confirm_kill_label(name),
         }
     };
-    render_bar(out, w, &bottom)?;
+    render_bar(out, w, &bottom, BarAlign::Left)?;
 
     Ok(())
 }
