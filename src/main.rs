@@ -8,7 +8,7 @@ use std::process::Command;
 use anyhow::{Context, Result};
 
 use crate::session::{ListReply, Session};
-use crate::tui::{InputParser, LoopAction, Model};
+use crate::tui::{InputParser, LoopAction, Mode, Model};
 
 fn fetch_sessions() -> Result<Vec<Session>> {
     let out = Command::new("shpool")
@@ -56,9 +56,7 @@ fn run_tui(initial: Vec<Session>) -> Result<()> {
                     .args(["attach", &name])
                     .status()
                     .context("spawning `shpool attach`")?;
-
-                let new_sessions = fetch_sessions()?;
-                model = Model::new(new_sessions);
+                model.refresh(fetch_sessions()?);
                 if let Some(i) = model.sessions.iter().position(|s| s.name == name) {
                     model.selected = i;
                 }
@@ -68,11 +66,7 @@ fn run_tui(initial: Vec<Session>) -> Result<()> {
                     .args(["kill", &name])
                     .status()
                     .context("running `shpool kill`")?;
-
-                let prev_idx = model.selected;
-                let new_sessions = fetch_sessions()?;
-                model = Model::new(new_sessions);
-                model.selected = prev_idx.min(model.sessions.len().saturating_sub(1));
+                model.refresh(fetch_sessions()?);
             }
             LoopAction::Quit => return Ok(()),
         }
@@ -96,6 +90,13 @@ fn event_loop<W: Write>(
             Ok(n) => {
                 if let Some(action) = tui::process_input(&buf[..n], model, parser) {
                     return Ok(action);
+                }
+                // Pick up sessions added or removed by other clients
+                // since the last keypress. Skipped in modal modes so
+                // typing into the create-name prompt isn't a per-keystroke
+                // `shpool list` storm.
+                if matches!(model.mode, Mode::Normal) {
+                    model.refresh(fetch_sessions()?);
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {
