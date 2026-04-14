@@ -150,9 +150,13 @@ pub const NORMAL_BINDINGS: &[Binding] = &[
         ],
     },
     Binding {
-        label: "ret",
+        label: "spc",
         description: "attach",
-        mappings: &[(Trigger::Byte(b'\r'), Key::Enter), (Trigger::Byte(b'\n'), Key::Enter)],
+        mappings: &[
+            (Trigger::Byte(b' '), Key::Enter),
+            (Trigger::Byte(b'\r'), Key::Enter),
+            (Trigger::Byte(b'\n'), Key::Enter),
+        ],
     },
     Binding {
         label: "n",
@@ -770,6 +774,7 @@ mod tests {
         let mut p = InputParser::new();
         assert_eq!(p.feed(b'\r'), Some(Key::Enter));
         assert_eq!(p.feed(b'\n'), Some(Key::Enter));
+        assert_eq!(p.feed(b' '), Some(Key::Enter));
     }
 
     #[test]
