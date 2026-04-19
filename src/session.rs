@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 #[derive(Debug, Deserialize)]
 pub struct ListReply {
@@ -8,7 +8,12 @@ pub struct ListReply {
 #[derive(Debug, Deserialize)]
 pub struct Session {
     pub name: String,
-    pub status: SessionStatus,
+    /// True iff shpool reports this session as currently attached to
+    /// another terminal. We don't care about the wire's other status
+    /// values (Disconnected, future variants) — only Attached drives
+    /// behavior (the attach pre-flight refusal + the row's status dot).
+    #[serde(rename = "status", deserialize_with = "deserialize_attached")]
+    pub attached: bool,
     pub started_at_unix_ms: u64,
     pub last_connected_at_unix_ms: u64,
     /// `None` if the session has never been detached from since it
@@ -27,18 +32,9 @@ impl Session {
     }
 }
 
-/// The status reported by `shpool list --json`. We don't display it
-/// (shpool's daemon takes up to ~1s to mark a session Disconnected
-/// after detach, so the label would flash stale), but we do use
-/// `Attached` in the pre-flight check to refuse re-attaching a
-/// session that shpool would reject with "already has a terminal
-/// attached" (which shpool reports on stderr with exit 0).
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
-pub enum SessionStatus {
-    Attached,
-    Disconnected,
-    #[serde(other)]
-    Unknown,
+fn deserialize_attached<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    let s = String::deserialize(d)?;
+    Ok(s == "Attached")
 }
 
 #[cfg(test)]
@@ -68,14 +64,15 @@ mod tests {
         let reply: ListReply = serde_json::from_str(json).unwrap();
         assert_eq!(reply.sessions.len(), 2);
         assert_eq!(reply.sessions[0].name, "main");
-        assert_eq!(reply.sessions[0].status, SessionStatus::Attached);
+        assert!(reply.sessions[0].attached);
         assert_eq!(reply.sessions[0].last_active_unix_ms(), 2000);
         assert_eq!(reply.sessions[1].name, "build");
+        assert!(!reply.sessions[1].attached);
         assert_eq!(reply.sessions[1].last_active_unix_ms(), 1500);
     }
 
     #[test]
-    fn parse_unknown_status() {
+    fn parse_unknown_status_is_not_attached() {
         let json = r#"{
             "sessions": [{
                 "name": "x",
@@ -86,7 +83,7 @@ mod tests {
             }]
         }"#;
         let reply: ListReply = serde_json::from_str(json).unwrap();
-        assert_eq!(reply.sessions[0].status, SessionStatus::Unknown);
+        assert!(!reply.sessions[0].attached);
     }
 
     #[test]

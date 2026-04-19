@@ -7,7 +7,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 
-use crate::session::{ListReply, Session, SessionStatus};
+use crate::session::{ListReply, Session};
 use crate::tui::{InputParser, LoopAction, Mode, Model};
 
 fn fetch_sessions() -> Result<Vec<Session>> {
@@ -68,8 +68,8 @@ fn run_tui(mut model: Model) -> Result<()> {
                 // reports "already has a terminal attached" on stderr
                 // with exit 0, and capturing stderr requires piping it
                 // — which breaks shpool's own detach detection (it
-                // checks isatty on stderr). So we check the status
-                // field here instead. Known false-positive: ~1s after
+                // checks isatty on stderr). So we check the attached
+                // flag here instead. Known false-positive: ~1s after
                 // your own detach, the daemon still reports Attached
                 // and we'd refuse a valid re-attach. Retry works.
                 refresh_sessions(&mut model);
@@ -77,39 +77,26 @@ fn run_tui(mut model: Model) -> Result<()> {
                     model.set_error(format!("session '{name}' is gone"));
                     continue;
                 };
-                if session.status == SessionStatus::Attached {
+                if session.attached {
                     model.set_error(format!("'{name}' already attached elsewhere"));
                     continue;
                 }
-                tty::clear_screen(&mut io::stdout())?;
-                let status = Command::new("shpool")
-                    .args(["attach", &name])
-                    .status()
-                    .context("spawning `shpool attach`")?;
-                refresh_sessions(&mut model);
-                if let Some(i) = model.sessions.iter().position(|s| s.name == name) {
-                    model.selected = i;
-                }
-                if !status.success() {
-                    model.set_error(format!("shpool attach {name} failed"));
-                }
+                let ok = shell_attach(&name)?;
+                finish_action(&mut model, &name, ok, format!("shpool attach {name} failed"));
             }
             LoopAction::Create(name) => {
-                // No existence pre-flight: the session doesn't exist
-                // yet — that's the whole point. `shpool attach` on an
-                // unknown name creates and attaches.
-                tty::clear_screen(&mut io::stdout())?;
-                let status = Command::new("shpool")
-                    .args(["attach", &name])
-                    .status()
-                    .context("spawning `shpool attach`")?;
+                // Pre-flight: reject names that already exist. `shpool
+                // attach` is create-or-attach, so without this check a
+                // duplicate name silently attaches (or flashes "already
+                // has a terminal attached" on stderr and no-ops) —
+                // neither is what the create prompt implies.
                 refresh_sessions(&mut model);
-                if let Some(i) = model.sessions.iter().position(|s| s.name == name) {
-                    model.selected = i;
+                if model.sessions.iter().any(|s| s.name == name) {
+                    model.set_error(format!("session '{name}' already exists"));
+                    continue;
                 }
-                if !status.success() {
-                    model.set_error(format!("shpool attach {name} failed"));
-                }
+                let ok = shell_attach(&name)?;
+                finish_action(&mut model, &name, ok, format!("shpool attach {name} failed"));
             }
             LoopAction::Kill(name) => {
                 refresh_sessions(&mut model);
@@ -121,19 +108,48 @@ fn run_tui(mut model: Model) -> Result<()> {
                     .args(["kill", &name])
                     .output()
                     .context("running `shpool kill`")?;
-                refresh_sessions(&mut model);
-                if !output.status.success() {
+                let ok = output.status.success();
+                let err_msg = if ok {
+                    String::new()
+                } else {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     let detail = stderr.trim();
                     if detail.is_empty() {
-                        model.set_error(format!("kill {name} failed"));
+                        format!("kill {name} failed")
                     } else {
-                        model.set_error(format!("kill {name}: {detail}"));
+                        format!("kill {name}: {detail}")
                     }
-                }
+                };
+                finish_action(&mut model, &name, ok, err_msg);
             }
             LoopAction::Quit => return Ok(()),
         }
+    }
+}
+
+/// Spawn `shpool attach <name>`, letting the child take over the TTY.
+/// Used for both Attach and Create (a name shpool doesn't know is
+/// created on the fly). Clears our rendered frame first so the
+/// user's freshly-attached shell starts on a clean viewport.
+fn shell_attach(name: &str) -> Result<bool> {
+    tty::clear_screen(&mut io::stdout())?;
+    let status = Command::new("shpool")
+        .args(["attach", name])
+        .status()
+        .context("spawning `shpool attach`")?;
+    Ok(status.success())
+}
+
+/// Post-action tail shared by attach/create/kill: refresh the session
+/// list, reselect the target by name if it's still there, and park an
+/// error message if the action failed.
+fn finish_action(model: &mut Model, name: &str, ok: bool, err_msg: String) {
+    refresh_sessions(model);
+    if let Some(i) = model.sessions.iter().position(|s| s.name == name) {
+        model.selected = i;
+    }
+    if !ok {
+        model.set_error(err_msg);
     }
 }
 

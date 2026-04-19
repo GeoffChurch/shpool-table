@@ -16,35 +16,11 @@ pub struct Model {
     /// Transient error message displayed in the bottom bar until the
     /// next keypress. Set by failed shell-outs and pre-flight checks.
     pub error: Option<String>,
-    /// Escape-sequence parser state used while in CreateInput mode so
-    /// that CSI sequences (arrow keys, focus events, bracketed-paste
-    /// markers, etc.) are silently consumed instead of being read as
-    /// a bare ESC cancel. Persists across reads to handle sequences
-    /// split across kernel read boundaries.
-    create_esc: CreateEscState,
-}
-
-#[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
-enum CreateEscState {
-    #[default]
-    Normal,
-    /// Saw `\x1b` — next byte decides whether it's a sequence (`[`)
-    /// or a 2-byte ESC form.
-    Esc,
-    /// Saw `\x1b [` — consuming CSI param/intermediate bytes until a
-    /// final byte in the 0x40..=0x7e range terminates the sequence.
-    EscBracket,
 }
 
 impl Model {
     pub fn new(sessions: Vec<Session>) -> Self {
-        Self {
-            sessions,
-            selected: 0,
-            mode: Mode::Normal,
-            error: None,
-            create_esc: CreateEscState::Normal,
-        }
+        Self { sessions, selected: 0, mode: Mode::Normal, error: None }
     }
 
     pub fn set_error(&mut self, msg: impl Into<String>) {
@@ -181,10 +157,25 @@ pub const CREATE_HINTS: &[(&str, &str)] = &[("ret", "create"), ("esc", "cancel")
 pub const CONFIRM_KILL_HINTS: &[(&str, &str)] = &[("y", "confirm"), ("n", "cancel")];
 
 // -- Input parser --
+//
+// One state machine turns a raw byte stream into a token stream:
+//   - Byte(b)    — a regular byte (caller decides what to do with it)
+//   - Csi(b)     — a terminated CSI sequence (`ESC [ ... <final>`);
+//                  the token carries only the final byte, which is all
+//                  our bindings care about.
+//   - BareEsc    — an unterminated ESC at the buffer boundary. A
+//                  terminal emits full CSI sequences as one write, so
+//                  a lone ESC at end-of-buffer is reliably a bare
+//                  Escape keypress.
+// This replaces a pair of near-identical parsers (one in Normal mode
+// returning Key, one inline in Create mode). Each mode handler now
+// interprets the token stream on its own terms.
 
-#[derive(Default)]
-pub struct InputParser {
-    state: ParserState,
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum Token {
+    Byte(u8),
+    Csi(u8),
+    BareEsc,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -195,57 +186,99 @@ enum ParserState {
     EscBracket,
 }
 
+#[derive(Default)]
+pub struct InputParser {
+    state: ParserState,
+}
+
 impl InputParser {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn feed(&mut self, byte: u8) -> Option<Key> {
-        match self.state {
-            ParserState::Normal => {
-                if byte == 0x1b {
-                    self.state = ParserState::Esc;
-                    return None;
+    /// Consume `bytes`, pushing tokens onto `out`. Parser state persists
+    /// across calls so a CSI sequence split across reads (rare but
+    /// possible) still parses correctly.
+    pub fn feed(&mut self, bytes: &[u8], out: &mut Vec<Token>) {
+        for &b in bytes {
+            match self.state {
+                ParserState::Normal => {
+                    if b == 0x1b {
+                        self.state = ParserState::Esc;
+                    } else {
+                        out.push(Token::Byte(b));
+                    }
                 }
-                // Fold uppercase ASCII to lowercase so bindings match
-                // `N`/`J`/etc. as well as `n`/`j`. Tradeoff: uppercase
-                // variants can no longer carry a distinct meaning.
-                let normalized = byte.to_ascii_lowercase();
-                Some(
-                    lookup(|t| matches!(t, Trigger::Byte(b) if b == normalized))
-                        .unwrap_or(Key::Other),
-                )
+                ParserState::Esc => {
+                    if b == b'[' {
+                        self.state = ParserState::EscBracket;
+                    } else {
+                        // ESC followed by a non-bracket byte in the same
+                        // buffer: treat as bare Escape plus whatever
+                        // followed (so ESC+q still fires Quit).
+                        out.push(Token::BareEsc);
+                        out.push(Token::Byte(b));
+                        self.state = ParserState::Normal;
+                    }
+                }
+                ParserState::EscBracket => {
+                    // CSI: skip param (0x30..=0x3f) and intermediate
+                    // (0x20..=0x2f) bytes until a final byte terminates.
+                    if (0x40..=0x7e).contains(&b) {
+                        out.push(Token::Csi(b));
+                        self.state = ParserState::Normal;
+                    }
+                }
             }
-            ParserState::Esc => match byte {
-                b'[' => {
-                    self.state = ParserState::EscBracket;
-                    None
-                }
-                _ => {
-                    self.state = ParserState::Normal;
-                    Some(Key::Other)
-                }
-            },
-            ParserState::EscBracket => {
-                self.state = ParserState::Normal;
-                Some(
-                    lookup(|t| matches!(t, Trigger::EscBracket(b) if b == byte))
-                        .unwrap_or(Key::Other),
-                )
-            }
+        }
+        if matches!(self.state, ParserState::Esc) {
+            out.push(Token::BareEsc);
+            self.state = ParserState::Normal;
         }
     }
 }
 
-fn lookup(matches: impl Fn(Trigger) -> bool) -> Option<Key> {
+// Precomputed dispatch tables so per-byte key lookup is O(1). Built
+// lazily from NORMAL_BINDINGS on first use.
+fn byte_key(b: u8) -> Option<Key> {
+    static T: std::sync::OnceLock<[Option<Key>; 256]> = std::sync::OnceLock::new();
+    T.get_or_init(|| build_table(|t| matches!(t, Trigger::Byte(_)), |t| match t {
+        Trigger::Byte(v) => v,
+        _ => unreachable!(),
+    }))[b as usize]
+}
+
+fn csi_key(b: u8) -> Option<Key> {
+    static T: std::sync::OnceLock<[Option<Key>; 256]> = std::sync::OnceLock::new();
+    T.get_or_init(|| build_table(|t| matches!(t, Trigger::EscBracket(_)), |t| match t {
+        Trigger::EscBracket(v) => v,
+        _ => unreachable!(),
+    }))[b as usize]
+}
+
+fn build_table(
+    matches: impl Fn(&Trigger) -> bool,
+    key_of: impl Fn(Trigger) -> u8,
+) -> [Option<Key>; 256] {
+    let mut arr = [None; 256];
     for binding in NORMAL_BINDINGS {
         for (trig, key) in binding.mappings {
-            if matches(*trig) {
-                return Some(*key);
+            if matches(trig) {
+                arr[key_of(*trig) as usize] = Some(*key);
             }
         }
     }
-    None
+    arr
+}
+
+/// Map a token to a normal-mode Key, for the Normal-mode handler.
+/// Tokens that don't map to any binding become Key::Other.
+fn token_to_key(token: Token) -> Key {
+    match token {
+        Token::Byte(b) => byte_key(b.to_ascii_lowercase()).unwrap_or(Key::Other),
+        Token::Csi(b) => csi_key(b).unwrap_or(Key::Other),
+        Token::BareEsc => Key::Other,
+    }
 }
 
 // -- Input processing --
@@ -257,55 +290,51 @@ pub fn process_input(
 ) -> Option<LoopAction> {
     // Any keypress dismisses a pending error — the user has now seen it.
     model.error = None;
+    let mut tokens = Vec::with_capacity(buf.len());
+    parser.feed(buf, &mut tokens);
     match model.mode {
-        Mode::Normal => process_normal(buf, model, parser),
-        Mode::CreateInput(_) => process_create_input(buf, model),
-        Mode::ConfirmKill(_) => process_confirm_kill(buf, model),
+        Mode::Normal => process_normal(&tokens, model),
+        Mode::CreateInput(_) => process_create_input(&tokens, model),
+        Mode::ConfirmKill(_) => process_confirm_kill(&tokens, model),
     }
 }
 
-fn process_normal(
-    buf: &[u8],
-    model: &mut Model,
-    parser: &mut InputParser,
-) -> Option<LoopAction> {
-    for &b in buf {
-        match parser.feed(b) {
-            Some(Key::Up) => model.select_prev(),
-            Some(Key::Down) => model.select_next(),
-            Some(Key::Enter) => {
+fn process_normal(tokens: &[Token], model: &mut Model) -> Option<LoopAction> {
+    for &t in tokens {
+        match token_to_key(t) {
+            Key::Up => model.select_prev(),
+            Key::Down => model.select_next(),
+            Key::Enter => {
                 if let Some(name) = model.selected_name() {
                     return Some(LoopAction::Attach(name.to_string()));
                 }
             }
-            Some(Key::NewSession) => {
+            Key::NewSession => {
                 model.mode = Mode::CreateInput(String::new());
-                model.create_esc = CreateEscState::Normal;
                 return None;
             }
-            Some(Key::KillSession) => {
+            Key::KillSession => {
                 if let Some(name) = model.selected_name() {
                     model.mode = Mode::ConfirmKill(name.to_string());
                 }
                 return None;
             }
-            Some(Key::Quit) => return Some(LoopAction::Quit),
-            Some(Key::Other) | None => {}
+            Key::Quit => return Some(LoopAction::Quit),
+            Key::Other => {}
         }
     }
     None
 }
 
-fn process_create_input(buf: &[u8], model: &mut Model) -> Option<LoopAction> {
-    for &b in buf {
-        match model.create_esc {
-            CreateEscState::Normal => match b {
-                0x1b => {
-                    // Possibly a bare ESC (cancel) or possibly the
-                    // start of a CSI sequence. Wait for the next byte
-                    // or the end of the buffer to decide.
-                    model.create_esc = CreateEscState::Esc;
-                }
+fn process_create_input(tokens: &[Token], model: &mut Model) -> Option<LoopAction> {
+    for &t in tokens {
+        match t {
+            Token::BareEsc => {
+                model.mode = Mode::Normal;
+                return None;
+            }
+            Token::Csi(_) => {} // arrow keys etc. are ignored in this mode
+            Token::Byte(b) => match b {
                 0x03 => {
                     model.mode = Mode::Normal;
                     return None;
@@ -332,48 +361,25 @@ fn process_create_input(buf: &[u8], model: &mut Model) -> Option<LoopAction> {
                 }
                 _ => {}
             },
-            CreateEscState::Esc => {
-                // Second byte of an ESC-prefixed sequence. `[` starts
-                // a CSI and we consume further bytes; anything else is
-                // a 2-byte sequence we silently drop.
-                model.create_esc = if b == b'[' {
-                    CreateEscState::EscBracket
-                } else {
-                    CreateEscState::Normal
-                };
-            }
-            CreateEscState::EscBracket => {
-                // CSI: keep consuming param (0x30..=0x3f) and
-                // intermediate (0x20..=0x2f) bytes until a final byte
-                // (0x40..=0x7e) terminates the sequence.
-                if (0x40..=0x7e).contains(&b) {
-                    model.create_esc = CreateEscState::Normal;
-                }
-            }
         }
-    }
-    // If the buffer ended while we were still in Esc state, the user
-    // most likely pressed the Escape key on its own — sequences
-    // normally arrive as a single read, so an unterminated ESC at a
-    // read boundary is a reliable bare-Escape signal. Treat as cancel.
-    if matches!(model.create_esc, CreateEscState::Esc) {
-        model.create_esc = CreateEscState::Normal;
-        model.mode = Mode::Normal;
     }
     None
 }
 
-fn process_confirm_kill(buf: &[u8], model: &mut Model) -> Option<LoopAction> {
-    for &b in buf {
-        if b == b'y' || b == b'Y' {
-            if let Mode::ConfirmKill(ref name) = model.mode {
-                let name = name.clone();
-                model.mode = Mode::Normal;
-                return Some(LoopAction::Kill(name));
+fn process_confirm_kill(tokens: &[Token], model: &mut Model) -> Option<LoopAction> {
+    for &t in tokens {
+        match t {
+            Token::Byte(b'y') | Token::Byte(b'Y') => {
+                if let Mode::ConfirmKill(ref name) = model.mode {
+                    let name = name.clone();
+                    model.mode = Mode::Normal;
+                    return Some(LoopAction::Kill(name));
+                }
             }
-        } else {
-            model.mode = Mode::Normal;
-            return None;
+            _ => {
+                model.mode = Mode::Normal;
+                return None;
+            }
         }
     }
     None
@@ -661,12 +667,18 @@ pub fn render(
 
         for (i, s) in model.sessions[start..end].iter().enumerate() {
             let abs_i = start + i;
-            let prefix = if abs_i == model.selected { "> " } else { "  " };
+            // 2-char prefix: [attached marker][selected arrow]. An
+            // asterisk marks sessions attached elsewhere so the user
+            // sees the "already attached" state without having to
+            // hit Enter and get the pre-flight rejection. ASCII so
+            // we don't depend on the terminal's locale/font.
+            let dot = if s.attached { '*' } else { ' ' };
+            let arrow = if abs_i == model.selected { '>' } else { ' ' };
             let created = format_age(now, s.started_at_unix_ms);
             let active = format_age(now, s.last_active_unix_ms());
             let text = clip(
                 &format!(
-                    "{prefix}{name:<name_width$}{gap}{created:<created_width$}{gap}{active:<active_width$}",
+                    "{dot}{arrow}{name:<name_width$}{gap}{created:<created_width$}{gap}{active:<active_width$}",
                     name = s.name,
                     gap = " ".repeat(COL_GAP),
                 ),
@@ -709,10 +721,9 @@ fn viewport(total: usize, selected: usize, max_visible: usize) -> (usize, usize)
 mod tests {
     use super::*;
     fn mk(name: &str) -> Session {
-        use crate::session::SessionStatus;
         Session {
             name: name.to_string(),
-            status: SessionStatus::Disconnected,
+            attached: false,
             started_at_unix_ms: 0,
             last_connected_at_unix_ms: 0,
             last_disconnected_at_unix_ms: None,
@@ -753,74 +764,77 @@ mod tests {
 
     // -- Parser tests --
 
+    fn tokenize(bytes: &[u8]) -> Vec<Token> {
+        let mut p = InputParser::new();
+        let mut out = vec![];
+        p.feed(bytes, &mut out);
+        out
+    }
+
     #[test]
     fn parser_up_arrow() {
-        let mut p = InputParser::new();
-        assert_eq!(p.feed(0x1b), None);
-        assert_eq!(p.feed(b'['), None);
-        assert_eq!(p.feed(b'A'), Some(Key::Up));
+        assert_eq!(tokenize(&[0x1b, b'[', b'A']), vec![Token::Csi(b'A')]);
     }
 
     #[test]
     fn parser_down_arrow() {
-        let mut p = InputParser::new();
-        assert_eq!(p.feed(0x1b), None);
-        assert_eq!(p.feed(b'['), None);
-        assert_eq!(p.feed(b'B'), Some(Key::Down));
+        assert_eq!(tokenize(&[0x1b, b'[', b'B']), vec![Token::Csi(b'B')]);
     }
 
     #[test]
-    fn parser_enter_crlf() {
-        let mut p = InputParser::new();
-        assert_eq!(p.feed(b'\r'), Some(Key::Enter));
-        assert_eq!(p.feed(b'\n'), Some(Key::Enter));
-        assert_eq!(p.feed(b' '), Some(Key::Enter));
+    fn parser_plain_bytes_are_byte_tokens() {
+        assert_eq!(
+            tokenize(b"q\rj"),
+            vec![Token::Byte(b'q'), Token::Byte(b'\r'), Token::Byte(b'j')],
+        );
     }
 
     #[test]
-    fn parser_quit() {
-        let mut p = InputParser::new();
-        assert_eq!(p.feed(b'q'), Some(Key::Quit));
-        assert_eq!(p.feed(0x03), Some(Key::Quit));
+    fn parser_unterminated_esc_is_bare() {
+        assert_eq!(tokenize(&[0x1b]), vec![Token::BareEsc]);
     }
 
     #[test]
-    fn parser_new_session() {
-        let mut p = InputParser::new();
-        assert_eq!(p.feed(b'n'), Some(Key::NewSession));
+    fn parser_esc_plus_non_bracket_emits_both() {
+        // ESC followed by a non-bracket byte in the same buffer:
+        // bare Escape plus the following byte. Lets ESC+q still quit.
+        assert_eq!(tokenize(&[0x1b, b'q']), vec![Token::BareEsc, Token::Byte(b'q')]);
     }
 
     #[test]
-    fn parser_kill_session() {
-        let mut p = InputParser::new();
-        assert_eq!(p.feed(b'd'), Some(Key::KillSession));
-    }
-
-    #[test]
-    fn parser_vim_navigation() {
-        let mut p = InputParser::new();
-        assert_eq!(p.feed(b'j'), Some(Key::Down));
-        assert_eq!(p.feed(b'k'), Some(Key::Up));
-    }
-
-    #[test]
-    fn parser_unknown_esc_sequence() {
-        let mut p = InputParser::new();
-        assert_eq!(p.feed(0x1b), None);
-        assert_eq!(p.feed(b'['), None);
-        assert_eq!(p.feed(b'Z'), Some(Key::Other));
-    }
-
-    #[test]
-    fn parser_stream() {
+    fn parser_csi_split_across_feeds() {
         let mut p = InputParser::new();
         let mut out = vec![];
-        for &b in &[0x1b, b'[', b'B', 0x1b, b'[', b'B', b'\r'] {
-            if let Some(k) = p.feed(b) {
-                out.push(k);
-            }
-        }
-        assert_eq!(out, vec![Key::Down, Key::Down, Key::Enter]);
+        p.feed(&[0x1b, b'['], &mut out);
+        assert!(out.is_empty());
+        p.feed(&[b'B'], &mut out);
+        assert_eq!(out, vec![Token::Csi(b'B')]);
+    }
+
+    #[test]
+    fn parser_csi_consumes_params() {
+        // CSI with a parameter byte before the final (e.g., F5).
+        assert_eq!(tokenize(b"\x1b[15~"), vec![Token::Csi(b'~')]);
+    }
+
+    #[test]
+    fn parser_stream_of_arrows_and_enter() {
+        assert_eq!(
+            tokenize(&[0x1b, b'[', b'B', 0x1b, b'[', b'B', b'\r']),
+            vec![Token::Csi(b'B'), Token::Csi(b'B'), Token::Byte(b'\r')],
+        );
+    }
+
+    #[test]
+    fn token_to_key_maps_bindings() {
+        assert_eq!(token_to_key(Token::Csi(b'A')), Key::Up);
+        assert_eq!(token_to_key(Token::Csi(b'B')), Key::Down);
+        assert_eq!(token_to_key(Token::Byte(b'q')), Key::Quit);
+        assert_eq!(token_to_key(Token::Byte(b'Q')), Key::Quit); // case fold
+        assert_eq!(token_to_key(Token::Byte(b'n')), Key::NewSession);
+        assert_eq!(token_to_key(Token::Byte(b'j')), Key::Down);
+        assert_eq!(token_to_key(Token::BareEsc), Key::Other);
+        assert_eq!(token_to_key(Token::Csi(b'Z')), Key::Other);
     }
 
     // -- process_input: normal mode --
