@@ -36,6 +36,21 @@ fn refresh_sessions(model: &mut Model) {
 }
 
 fn main() -> Result<()> {
+    if let Ok(inside) = std::env::var("SHPOOL_SESSION_NAME") {
+        // Nested sessions get messy: a force-attach to the outer
+        // session bumps us off, sessions created from here inherit
+        // this env, and ^D leaves the user in the wrong layer.
+        // Detach first, then fall through to `shpool list`.
+        eprintln!(
+            "shpool-table: inside shpool session \"{inside}\" — won't run here. Nested\n\
+             sessions get messy (outer attach gets bumped on force, sessions created\n\
+             here inherit this env, ^D leaves you in the wrong layer). Detach first\n\
+             to manage sessions. Current list:\n"
+        );
+        use std::os::unix::process::CommandExt;
+        let err = Command::new("shpool").arg("list").exec();
+        anyhow::bail!("exec shpool list: {err}");
+    }
     let mut model = Model::new(Vec::new());
     refresh_sessions(&mut model);
     run_tui(model)
@@ -69,20 +84,29 @@ fn run_tui(mut model: Model) -> Result<()> {
                 // with exit 0, and capturing stderr requires piping it
                 // — which breaks shpool's own detach detection (it
                 // checks isatty on stderr). So we check the attached
-                // flag here instead. Known false-positive: ~1s after
-                // your own detach, the daemon still reports Attached
-                // and we'd refuse a valid re-attach. Retry works.
+                // flag here instead. If it raced into Attached since
+                // the keystroke, fall into the force-confirm prompt
+                // rather than silently no-opping.
                 refresh_sessions(&mut model);
                 let Some(session) = model.sessions.iter().find(|s| s.name == name) else {
                     model.set_error(format!("session '{name}' is gone"));
                     continue;
                 };
                 if session.attached {
-                    model.set_error(format!("'{name}' already attached elsewhere"));
+                    model.mode = Mode::ConfirmForce(name);
                     continue;
                 }
-                let ok = shell_attach(&name)?;
+                let ok = shell_attach(&name, false)?;
                 finish_action(&mut model, &name, ok, format!("shpool attach {name} failed"));
+            }
+            LoopAction::AttachForce(name) => {
+                refresh_sessions(&mut model);
+                if !model.sessions.iter().any(|s| s.name == name) {
+                    model.set_error(format!("session '{name}' is gone"));
+                    continue;
+                }
+                let ok = shell_attach(&name, true)?;
+                finish_action(&mut model, &name, ok, format!("shpool attach -f {name} failed"));
             }
             LoopAction::Create(name) => {
                 // Pre-flight: reject names that already exist. `shpool
@@ -95,7 +119,7 @@ fn run_tui(mut model: Model) -> Result<()> {
                     model.set_error(format!("session '{name}' already exists"));
                     continue;
                 }
-                let ok = shell_attach(&name)?;
+                let ok = shell_attach(&name, false)?;
                 finish_action(&mut model, &name, ok, format!("shpool attach {name} failed"));
             }
             LoopAction::Kill(name) => {
@@ -131,12 +155,15 @@ fn run_tui(mut model: Model) -> Result<()> {
 /// Used for both Attach and Create (a name shpool doesn't know is
 /// created on the fly). Clears our rendered frame first so the
 /// user's freshly-attached shell starts on a clean viewport.
-fn shell_attach(name: &str) -> Result<bool> {
+fn shell_attach(name: &str, force: bool) -> Result<bool> {
     tty::clear_screen(&mut io::stdout())?;
-    let status = Command::new("shpool")
-        .args(["attach", name])
-        .status()
-        .context("spawning `shpool attach`")?;
+    let mut cmd = Command::new("shpool");
+    cmd.arg("attach");
+    if force {
+        cmd.arg("-f");
+    }
+    cmd.arg(name);
+    let status = cmd.status().context("spawning `shpool attach`")?;
     Ok(status.success())
 }
 

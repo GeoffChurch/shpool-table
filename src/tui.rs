@@ -7,6 +7,7 @@ pub enum Mode {
     Normal,
     CreateInput(String),
     ConfirmKill(String),
+    ConfirmForce(String),
 }
 
 pub struct Model {
@@ -78,6 +79,11 @@ pub enum Key {
 #[derive(Debug, PartialEq)]
 pub enum LoopAction {
     Attach(String),
+    /// Force-attach (`shpool attach -f <name>`) — bumps an existing
+    /// terminal off the session. Only reached via the ConfirmForce
+    /// prompt, which is itself only entered after the attach
+    /// pre-flight detects the session is attached elsewhere.
+    AttachForce(String),
     /// Create (via `shpool attach <new-name>`) and immediately attach.
     /// Distinct from Attach so the main loop can skip the
     /// session-must-exist pre-flight check.
@@ -155,6 +161,7 @@ pub const NORMAL_BINDINGS: &[Binding] = &[
 /// process_create_input; these just keep the display in sync.
 pub const CREATE_HINTS: &[(&str, &str)] = &[("ret", "create"), ("esc", "cancel")];
 pub const CONFIRM_KILL_HINTS: &[(&str, &str)] = &[("y", "confirm"), ("n", "cancel")];
+pub const CONFIRM_FORCE_HINTS: &[(&str, &str)] = &[("y", "force"), ("n", "cancel")];
 
 // -- Input parser --
 //
@@ -296,6 +303,7 @@ pub fn process_input(
         Mode::Normal => process_normal(&tokens, model),
         Mode::CreateInput(_) => process_create_input(&tokens, model),
         Mode::ConfirmKill(_) => process_confirm_kill(&tokens, model),
+        Mode::ConfirmForce(_) => process_confirm_force(&tokens, model),
     }
 }
 
@@ -374,6 +382,25 @@ fn process_confirm_kill(tokens: &[Token], model: &mut Model) -> Option<LoopActio
                     let name = name.clone();
                     model.mode = Mode::Normal;
                     return Some(LoopAction::Kill(name));
+                }
+            }
+            _ => {
+                model.mode = Mode::Normal;
+                return None;
+            }
+        }
+    }
+    None
+}
+
+fn process_confirm_force(tokens: &[Token], model: &mut Model) -> Option<LoopAction> {
+    for &t in tokens {
+        match t {
+            Token::Byte(b'y') | Token::Byte(b'Y') => {
+                if let Mode::ConfirmForce(ref name) = model.mode {
+                    let name = name.clone();
+                    model.mode = Mode::Normal;
+                    return Some(LoopAction::AttachForce(name));
                 }
             }
             _ => {
@@ -475,6 +502,15 @@ fn confirm_kill_label(name: &str) -> Label {
     l.push_key(&format!("\"{name}\""));
     l.push_plain("?   (");
     push_hints(&mut l, CONFIRM_KILL_HINTS);
+    l.push_plain(")");
+    l
+}
+
+fn confirm_force_label(name: &str) -> Label {
+    let mut l = Label::default();
+    l.push_key(&format!("\"{name}\""));
+    l.push_plain(" already attached. force-attach?   (");
+    push_hints(&mut l, CONFIRM_FORCE_HINTS);
     l.push_plain(")");
     l
 }
@@ -699,6 +735,7 @@ pub fn render(
             Mode::Normal => normal_bindings_label(),
             Mode::CreateInput(input) => create_input_label(input),
             Mode::ConfirmKill(name) => confirm_kill_label(name),
+            Mode::ConfirmForce(name) => confirm_force_label(name),
         }
     };
     render_bar(out, w, &bottom, BarAlign::Left)?;
@@ -974,6 +1011,27 @@ mod tests {
         let mut m = Model::new(vec![]);
         let mut p = InputParser::new();
         assert_eq!(process_input(b"d", &mut m, &mut p), None);
+        assert_eq!(m.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn process_input_force_confirm() {
+        let mut m = Model::new(vec![mk("a")]);
+        m.mode = Mode::ConfirmForce("a".into());
+        let mut p = InputParser::new();
+        assert_eq!(
+            process_input(b"y", &mut m, &mut p),
+            Some(LoopAction::AttachForce("a".into())),
+        );
+        assert_eq!(m.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn process_input_force_cancel() {
+        let mut m = Model::new(vec![mk("a")]);
+        m.mode = Mode::ConfirmForce("a".into());
+        let mut p = InputParser::new();
+        assert_eq!(process_input(b"n", &mut m, &mut p), None);
         assert_eq!(m.mode, Mode::Normal);
     }
 
