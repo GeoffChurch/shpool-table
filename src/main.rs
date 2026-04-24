@@ -8,7 +8,7 @@ use std::process;
 use anyhow::{Context, Result};
 
 use crate::session::{ListReply, Session};
-use crate::tui::{Command, Event, InputParser, Model};
+use crate::tui::{Command, Event, Input, InputParser, Model};
 
 /// Current wall-clock time in unix milliseconds. Passed into `render`
 /// so the relative-age columns have a deterministic `now` (tests pass
@@ -114,14 +114,19 @@ fn main_loop<W: Write>(
                 model.quit = true;
             }
             Ok(n) => {
-                // A single read can decode to multiple keys (pastes,
-                // CSI sequences, jj\r typed fast). Feed each through
+                // A single read can decode to multiple inputs (pastes,
+                // CSI sequences, jj\r typed fast, a focus-report
+                // arriving next to a keystroke). Feed each through
                 // its own cascade so auto-refresh / attach / etc.
-                // fire per keystroke.
-                let mut keys = Vec::new();
-                parser.feed(&buf[..n], &mut keys);
-                for key in keys {
-                    run_cascade(model, Event::Key(key), out, raw)?;
+                // fire per input.
+                let mut inputs = Vec::new();
+                parser.feed(&buf[..n], &mut inputs);
+                for input in inputs {
+                    let event = match input {
+                        Input::Key(k) => Event::Key(k),
+                        Input::FocusGained => Event::FocusGained,
+                    };
+                    run_cascade(model, event, out, raw)?;
                     if model.quit {
                         break;
                     }

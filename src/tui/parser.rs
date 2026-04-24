@@ -1,22 +1,28 @@
-// -- Input parser (bytes → Key stream) --
+// -- Input parser (bytes → Input stream) --
 //
 // A state machine that consumes a raw byte stream and emits decoded
-// keystrokes. Previously this emitted a Token stream (Byte / Csi /
-// BareEsc) and an auxiliary token_to_key function did the byte →
-// semantic-key mapping. That split meant dispatch sites had to know
-// about the parser's intermediate representation. Now the parser
-// decodes directly, and downstream code only ever sees Key.
+// inputs: either semantic keystrokes (Input::Key) or focus events
+// (Input::FocusGained). Downstream code pattern-matches on Input
+// rather than raw bytes or intermediate tokens.
 //
 // Recognized ESC sequences:
-//   - ESC [ A/B/C/D          → Key::Up/Down/Right/Left
-//   - ESC alone at buffer end → Key::Esc (terminals batch full CSIs in
-//                                one write, so a trailing lone ESC is
-//                                reliably a bare Escape keypress)
-//   - ESC + non-bracket byte  → Key::Esc + decoded(byte). Lets
-//                                Alt-letter and ESC-then-q still work.
-//   - ESC [ ... <unknown>     → Key::Other.
+//   - ESC [ A/B/C/D          → Input::Key(Up/Down/Right/Left)
+//   - ESC [ I                → Input::FocusGained (terminal regained
+//                               focus — we use this to refresh the
+//                               session list on re-focus)
+//   - ESC [ O                → focus lost; discarded silently
+//   - ESC alone at buffer end → Input::Key(Esc)
+//   - ESC + non-bracket byte  → Input::Key(Esc) + decoded(byte). Lets
+//                                Alt-letter and ESC-then-q still fire.
+//   - ESC [ ... <unknown>     → Input::Key(Other).
 
 use super::keymap::Key;
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum Input {
+    Key(Key),
+    FocusGained,
+}
 
 #[derive(Default, Clone, Copy)]
 enum ParserState {
@@ -36,17 +42,17 @@ impl InputParser {
         Self::default()
     }
 
-    /// Consume `bytes`, pushing decoded keys onto `out`. Parser state
-    /// persists across calls so a CSI sequence split across reads
-    /// (rare but possible) still parses correctly.
-    pub fn feed(&mut self, bytes: &[u8], out: &mut Vec<Key>) {
+    /// Consume `bytes`, pushing decoded inputs onto `out`. Parser
+    /// state persists across calls so a CSI sequence split across
+    /// reads (rare but possible) still parses correctly.
+    pub fn feed(&mut self, bytes: &[u8], out: &mut Vec<Input>) {
         for &b in bytes {
             match self.state {
                 ParserState::Normal => {
                     if b == 0x1b {
                         self.state = ParserState::Esc;
                     } else {
-                        out.push(decode_byte(b));
+                        out.push(Input::Key(decode_byte(b)));
                     }
                 }
                 ParserState::Esc => {
@@ -56,8 +62,8 @@ impl InputParser {
                         // ESC + non-bracket byte: emit both as separate
                         // keystrokes so Alt-letter chords and ESC-then-q
                         // still fire their individual actions.
-                        out.push(Key::Esc);
-                        out.push(decode_byte(b));
+                        out.push(Input::Key(Key::Esc));
+                        out.push(Input::Key(decode_byte(b)));
                         self.state = ParserState::Normal;
                     }
                 }
@@ -65,14 +71,21 @@ impl InputParser {
                     // CSI: skip param (0x30..=0x3f) and intermediate
                     // (0x20..=0x2f) bytes until a final byte terminates.
                     if (0x40..=0x7e).contains(&b) {
-                        out.push(decode_csi(b));
+                        match b {
+                            b'I' => out.push(Input::FocusGained),
+                            // ESC [ O is focus-lost; we don't have a
+                            // use for it (the next keystroke arrives
+                            // via stdin anyway), so discard.
+                            b'O' => {}
+                            _ => out.push(Input::Key(decode_csi(b))),
+                        }
                         self.state = ParserState::Normal;
                     }
                 }
             }
         }
         if matches!(self.state, ParserState::Esc) {
-            out.push(Key::Esc);
+            out.push(Input::Key(Key::Esc));
             self.state = ParserState::Normal;
         }
     }
@@ -113,34 +126,46 @@ fn decode_csi(final_byte: u8) -> Key {
 mod tests {
     use super::*;
 
-    fn decode(bytes: &[u8]) -> Vec<Key> {
+    fn decode(bytes: &[u8]) -> Vec<Input> {
         let mut p = InputParser::new();
         let mut out = vec![];
         p.feed(bytes, &mut out);
         out
     }
 
+    /// Shortcut for tests that only care about the Key stream,
+    /// filtering out any focus events.
+    fn decode_keys(bytes: &[u8]) -> Vec<Key> {
+        decode(bytes)
+            .into_iter()
+            .filter_map(|i| match i {
+                Input::Key(k) => Some(k),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn parser_up_arrow() {
-        assert_eq!(decode(&[0x1b, b'[', b'A']), vec![Key::Up]);
+        assert_eq!(decode_keys(&[0x1b, b'[', b'A']), vec![Key::Up]);
     }
 
     #[test]
     fn parser_down_arrow() {
-        assert_eq!(decode(&[0x1b, b'[', b'B']), vec![Key::Down]);
+        assert_eq!(decode_keys(&[0x1b, b'[', b'B']), vec![Key::Down]);
     }
 
     #[test]
     fn parser_plain_bytes_decode_to_chars_and_enter() {
         assert_eq!(
-            decode(b"q\rj"),
+            decode_keys(b"q\rj"),
             vec![Key::Char(b'q'), Key::Enter, Key::Char(b'j')],
         );
     }
 
     #[test]
     fn parser_unterminated_esc_is_bare() {
-        assert_eq!(decode(&[0x1b]), vec![Key::Esc]);
+        assert_eq!(decode_keys(&[0x1b]), vec![Key::Esc]);
     }
 
     #[test]
@@ -148,7 +173,7 @@ mod tests {
         // ESC followed by a non-bracket byte in the same buffer:
         // bare Esc plus the decoded following byte. Lets ESC+q still
         // fire the Quit binding (via the Char(b'q') that follows).
-        assert_eq!(decode(&[0x1b, b'q']), vec![Key::Esc, Key::Char(b'q')]);
+        assert_eq!(decode_keys(&[0x1b, b'q']), vec![Key::Esc, Key::Char(b'q')]);
     }
 
     #[test]
@@ -158,7 +183,7 @@ mod tests {
         p.feed(&[0x1b, b'['], &mut out);
         assert!(out.is_empty());
         p.feed(&[b'B'], &mut out);
-        assert_eq!(out, vec![Key::Down]);
+        assert_eq!(out, vec![Input::Key(Key::Down)]);
     }
 
     #[test]
@@ -166,14 +191,39 @@ mod tests {
         // CSI with a parameter byte before the final (e.g., F5 sends
         // ESC [ 15 ~). We don't bind function keys, so the final `~`
         // decodes to Key::Other.
-        assert_eq!(decode(b"\x1b[15~"), vec![Key::Other]);
+        assert_eq!(decode_keys(b"\x1b[15~"), vec![Key::Other]);
     }
 
     #[test]
     fn parser_stream_of_arrows_and_enter() {
         assert_eq!(
-            decode(&[0x1b, b'[', b'B', 0x1b, b'[', b'B', b'\r']),
+            decode_keys(&[0x1b, b'[', b'B', 0x1b, b'[', b'B', b'\r']),
             vec![Key::Down, Key::Down, Key::Enter],
+        );
+    }
+
+    #[test]
+    fn parser_focus_gained() {
+        // ESC [ I is the terminal's focus-in report (requires
+        // focus-reporting to be enabled, which tty.rs does on
+        // alt-screen entry).
+        assert_eq!(decode(b"\x1b[I"), vec![Input::FocusGained]);
+    }
+
+    #[test]
+    fn parser_focus_lost_is_dropped() {
+        // ESC [ O is focus-out. We don't need to react — no event
+        // emitted at all.
+        assert_eq!(decode(b"\x1b[O"), vec![]);
+    }
+
+    #[test]
+    fn parser_focus_then_keystroke() {
+        // Focus report arriving alongside input: both decode and
+        // survive in order.
+        assert_eq!(
+            decode(b"\x1b[Ij"),
+            vec![Input::FocusGained, Input::Key(Key::Char(b'j'))],
         );
     }
 

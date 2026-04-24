@@ -10,6 +10,11 @@ pub enum Event {
     /// on the Key to drive mode transitions and emit Commands.
     Key(Key),
 
+    /// The terminal window regained focus. Triggers a Refresh — the
+    /// user was likely away, so session state may have changed while
+    /// they weren't looking.
+    FocusGained,
+
     /// The `shpool list --json` shell-out returned a fresh session
     /// list. `update` applies it to the model and emits no Command.
     SessionsRefreshed(Vec<Session>),

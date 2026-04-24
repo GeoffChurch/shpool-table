@@ -10,6 +10,6 @@ pub mod view;
 pub use command::Command;
 pub use event::Event;
 pub use model::{Mode, Model};
-pub use parser::InputParser;
+pub use parser::{Input, InputParser};
 pub use update::update;
 pub use view::render;

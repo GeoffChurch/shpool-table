@@ -27,6 +27,7 @@ pub fn update(model: &mut Model, event: Event) -> Option<Command> {
 
     let cmd = match event {
         Event::Key(k) => handle_key(model, k),
+        Event::FocusGained => Some(Command::Refresh),
         Event::SessionsRefreshed(sessions) => {
             model.refresh(sessions);
             None
@@ -498,6 +499,20 @@ mod tests {
         let mut m = Model::new(vec![]);
         m.set_error("sticky");
         update(&mut m, Event::SessionsRefreshed(vec![]));
+        assert_eq!(m.error.as_deref(), Some("sticky"));
+    }
+
+    #[test]
+    fn focus_gained_triggers_refresh() {
+        let mut m = Model::new(vec![]);
+        assert_eq!(update(&mut m, Event::FocusGained), Some(Command::Refresh));
+    }
+
+    #[test]
+    fn focus_gained_does_not_clear_error() {
+        let mut m = Model::new(vec![]);
+        m.set_error("sticky");
+        update(&mut m, Event::FocusGained);
         assert_eq!(m.error.as_deref(), Some("sticky"));
     }
 
