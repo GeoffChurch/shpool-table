@@ -126,22 +126,25 @@ fn main() -> Result<()> {
 
 fn run_tui(flags: &Flags) -> Result<()> {
     tty::install_sigwinch_handler().context("installing SIGWINCH handler")?;
+    // Install before constructing the guards so an error in
+    // `AltScreen::enter` (unlikely) or any later code still resets
+    // the terminal on panic. `panic = "abort"` builds rely on this
+    // hook since Drop doesn't run in that mode.
+    tty::install_panic_hook();
 
     let mut model = Model::new(Vec::new());
     let mut parser = InputParser::new();
 
-    // RawMode guard held for the whole TUI session — only temporarily
-    // toggled via suspend/resume when we need to hand the terminal to
-    // a child process. Dropped on exit (normal or error) via RAII.
+    // Terminal state guards: both Drop on any exit path (normal
+    // return, `?` error propagation, unwinding panic) so the user's
+    // shell gets a clean tty back. `execute` toggles them via
+    // suspend/resume when shelling out to `shpool attach`.
     let raw = tty::RawMode::enter().context("entering raw mode")?;
+    let alt = tty::AltScreen::enter().context("entering alt-screen")?;
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
-    tty::enter_alt_screen(&mut out)?;
 
-    // Ensure we leave alt-screen even on error returns from main_loop.
-    let result = main_loop(&mut model, &mut parser, &mut out, &raw, flags);
-
-    let _ = tty::leave_alt_screen(&mut out);
+    let result = main_loop(&mut model, &mut parser, &mut out, &raw, &alt, flags);
     let _ = out.flush();
     result
 }
@@ -156,6 +159,7 @@ fn main_loop<W: Write>(
     parser: &mut InputParser,
     out: &mut W,
     raw: &tty::RawMode,
+    alt: &tty::AltScreen,
     flags: &Flags,
 ) -> Result<()> {
     // Initial fetch: if the daemon is up, show its list immediately;
@@ -165,7 +169,7 @@ fn main_loop<W: Write>(
         Ok(s) => Event::SessionsRefreshed(s),
         Err(e) => Event::RefreshFailed(format!("{e}")),
     };
-    run_cascade(model, initial, out, raw, flags)?;
+    run_cascade(model, initial, out, raw, alt, flags)?;
 
     let mut buf = [0u8; 16];
     loop {
@@ -174,7 +178,7 @@ fn main_loop<W: Write>(
         out.flush()?;
 
         // `quit` is checked AFTER the draw, not before. The final
-        // frame is written but immediately wiped by leave_alt_screen
+        // frame is written but immediately wiped by AltScreen::drop
         // on exit, so the user never sees it. Saves one draw-on-exit
         // and keeps the model's visible state aligned with the last
         // drawn frame — inverting would subtly decouple them.
@@ -200,7 +204,7 @@ fn main_loop<W: Write>(
                         Input::Key(k) => Event::Key(k),
                         Input::FocusGained => Event::FocusGained,
                     };
-                    run_cascade(model, event, out, raw, flags)?;
+                    run_cascade(model, event, out, raw, alt, flags)?;
                     if model.quit {
                         break;
                     }
@@ -229,11 +233,12 @@ fn run_cascade<W: Write>(
     event: Event,
     out: &mut W,
     raw: &tty::RawMode,
+    alt: &tty::AltScreen,
     flags: &Flags,
 ) -> Result<()> {
     let mut next = tui::update(model, event);
     while let Some(cmd) = next.take() {
-        let follow_up = execute(cmd, model, out, raw, flags)?;
+        let follow_up = execute(cmd, model, out, raw, alt, flags)?;
         let Some(ev) = follow_up else { break };
         next = tui::update(model, ev);
     }
@@ -249,6 +254,7 @@ fn execute<W: Write>(
     model: &mut Model,
     out: &mut W,
     raw: &tty::RawMode,
+    alt: &tty::AltScreen,
     flags: &Flags,
 ) -> Result<Option<Event>> {
     match cmd {
@@ -293,7 +299,8 @@ fn execute<W: Write>(
                 Ok(Some(Event::SessionsRefreshed(sessions)))
             }
             Preflight::ClearToAttach => {
-                let ok = with_tui_suspended(out, raw, || shell_attach(&name, force, flags))?;
+                let ok =
+                    with_tui_suspended(out, raw, alt, || shell_attach(&name, force, flags))?;
                 Ok(Some(Event::AttachExited { ok, name }))
             }
         },
@@ -301,7 +308,7 @@ fn execute<W: Write>(
             // Duplicate-name check happened in update; by here it's
             // safe to spawn. `shpool attach` with a new name creates
             // atomically on the daemon side.
-            let ok = with_tui_suspended(out, raw, || shell_attach(&name, false, flags))?;
+            let ok = with_tui_suspended(out, raw, alt, || shell_attach(&name, false, flags))?;
             Ok(Some(Event::AttachExited { ok, name }))
         }
         Command::Kill(name) => {
@@ -462,12 +469,13 @@ mod tests {
 fn with_tui_suspended<F, R, W: Write>(
     out: &mut W,
     raw: &tty::RawMode,
+    alt: &tty::AltScreen,
     f: F,
 ) -> Result<R>
 where
     F: FnOnce() -> Result<R>,
 {
-    tty::leave_alt_screen(out)?;
+    alt.suspend()?;
     // Clear the primary screen before the child starts so its first
     // frame doesn't land on top of leftover shell prompt history.
     tty::clear_screen(out)?;
@@ -478,7 +486,7 @@ where
     let result = f();
 
     raw.resume()?;
-    tty::enter_alt_screen(out)?;
+    alt.resume()?;
     out.flush()?;
 
     result

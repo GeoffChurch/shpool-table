@@ -1,5 +1,6 @@
 use std::io::{self, Write};
 use std::mem::MaybeUninit;
+use std::sync::Once;
 
 use anyhow::{Context, Result};
 
@@ -107,29 +108,94 @@ pub fn read_stdin(buf: &mut [u8]) -> io::Result<usize> {
     }
 }
 
-pub fn enter_alt_screen(out: &mut impl Write) -> io::Result<()> {
-    out.write_all(b"\x1b[?1049h")?;
-    out.write_all(b"\x1b[?25l")?;
-    // DECCKM off: force normal cursor-key mode so arrows send
-    // `ESC [ A/B` (which our parser understands) rather than the
-    // application-mode `ESC O A/B`. Emacs and some other TUIs
-    // leave DECCKM on; a mid-session detach never gives them a
-    // chance to restore it, so we set the state ourselves.
-    out.write_all(b"\x1b[?1l")?;
-    // DECAWM off: disable auto-wrap at the right margin. We clip
-    // rows to width in the renderer too, but this is a defensive
-    // layer — any off-by-one in our width accounting gets
-    // absorbed at the margin instead of breaking the layout.
-    out.write_all(b"\x1b[?7l")?;
+// Terminal state sequences. `TUI_ENTER` sets: 1049h alt-screen,
+// 25l cursor hidden, 1l DECCKM off (arrows send `ESC [ A/B` not
+// `ESC O A/B`), 7l DECAWM off (no auto-wrap at right margin),
+// 1004h focus reporting on.
+//
+// DECCKM: Emacs and some other TUIs leave it on; a mid-session detach
+// never gives them a chance to restore it, so we assert it off here.
+// DECAWM: renderer clips to width anyway — this is a defensive layer.
+//
+// `TUI_LEAVE` mirrors enter but deliberately OMITS re-enabling DECCKM
+// (`?1h`). The user's shell typically wants DECCKM off by default.
+const TUI_ENTER: &[u8] = b"\x1b[?1049h\x1b[?25l\x1b[?1l\x1b[?7l\x1b[?1004h";
+const TUI_LEAVE: &[u8] = b"\x1b[?25h\x1b[?7h\x1b[?1004l\x1b[?1049l";
+
+/// Write `bytes` to stdout via `libc::write`, retrying on EINTR and
+/// handling short writes. Used for terminal-state sequences so they
+/// bypass any BufWriter the caller owns — safe to call from Drop
+/// during unwinding, where the BufWriter may be partially torn down.
+fn write_raw_stdout(bytes: &[u8]) -> io::Result<()> {
+    let mut remaining = bytes;
+    while !remaining.is_empty() {
+        let n = unsafe {
+            libc::write(
+                libc::STDOUT_FILENO,
+                remaining.as_ptr() as *const libc::c_void,
+                remaining.len(),
+            )
+        };
+        if n < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        remaining = &remaining[n as usize..];
+    }
     Ok(())
 }
 
-pub fn leave_alt_screen(out: &mut impl Write) -> io::Result<()> {
-    out.write_all(b"\x1b[?25h")?;
-    // DECAWM back on so the user's shell behaves normally afterward.
-    out.write_all(b"\x1b[?7h")?;
-    out.write_all(b"\x1b[?1049l")?;
-    Ok(())
+/// RAII guard for alt-screen + cursor-hide + DECCKM/DECAWM + focus
+/// reporting. `Drop` writes the disable sequence via `libc::write`
+/// directly to the tty fd, so unwinding panics, `?` early returns,
+/// and normal exits all clean up without threading a writer through.
+pub struct AltScreen;
+
+impl AltScreen {
+    pub fn enter() -> Result<Self> {
+        write_raw_stdout(TUI_ENTER).context("enter alt-screen")?;
+        Ok(AltScreen)
+    }
+
+    /// Temporarily leave alt-screen so a child process (`shpool
+    /// attach`) gets a normal terminal. Pair with `resume`.
+    pub fn suspend(&self) -> Result<()> {
+        write_raw_stdout(TUI_LEAVE).context("suspend alt-screen")
+    }
+
+    /// Re-enter alt-screen after a `suspend`.
+    pub fn resume(&self) -> Result<()> {
+        write_raw_stdout(TUI_ENTER).context("resume alt-screen")
+    }
+}
+
+impl Drop for AltScreen {
+    fn drop(&mut self) {
+        let _ = write_raw_stdout(TUI_LEAVE);
+    }
+}
+
+static PANIC_HOOK: Once = Once::new();
+
+/// Install a panic hook that emits the terminal-reset sequence before
+/// delegating to the previous hook. Idempotent. Required for
+/// `panic = "abort"` builds where Drop never runs; belt-and-braces on
+/// unwinding builds in case a guard gets refactored out of a code path.
+///
+/// Hook order matters: resets go out first so the default hook's panic
+/// message lands on the primary screen, not the alt-screen that's
+/// about to be wiped.
+pub fn install_panic_hook() {
+    PANIC_HOOK.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = write_raw_stdout(TUI_LEAVE);
+            prev(info);
+        }));
+    });
 }
 
 /// Clear the visible screen and home the cursor. Used right before
