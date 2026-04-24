@@ -1,143 +1,162 @@
-use super::parser::Token;
+// Semantic keystroke — the parser's output vocabulary. Downstream
+// mode handlers (Normal, Create, ConfirmKill, ConfirmForce) pattern-
+// match on this rather than on raw bytes.
+//
+// Char(b) carries the raw byte so we can distinguish 'y' from 'Y'
+// etc. — case-folding is done explicitly in the binding table where
+// wanted, rather than globally at lookup time. That means a future
+// case-distinct binding (e.g., vim-style `G` = bottom) is just a data
+// change, not a code change.
+//
+// Ctrl(b) is kept separate from Char so dispatch can match Ctrl-C
+// without confusing it with the printable 'c'. Named controls that
+// have their own Key variant (Backspace, Tab, Enter) don't appear as
+// Ctrl() — the named variant is canonical.
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub enum Key {
+    // Arrows.
     Up,
     Down,
+    Left,
+    Right,
+    // Named controls.
     Enter,
-    Quit,
-    NewSession,
-    KillSession,
+    Esc,
+    Backspace,
+    Tab,
+    // Raw bytes.
+    Ctrl(u8),
+    Char(u8),
+    // Anything we don't recognize (unmapped CSI finals, non-ASCII bytes).
     Other,
 }
 
-// -- Key binding tables --
+// -- Normal-mode action dispatch --
 //
-// This table is the single source of truth for both the parser's key
-// dispatch and the footer text rendered in each mode. Each Binding is
-// one footer row (label + description) plus a list of (trigger, key)
-// mappings the parser dispatches from. A single binding can fan out
-// to multiple keys (e.g., navigation maps ↑/k → Up and ↓/j → Down).
+// The set of logical actions bound to keys in Normal mode. We use an
+// enum rather than a direct `fn(&mut Model)` in the binding table
+// because actions differ in what state they touch: SelectNext is
+// stateless but AttachSelected needs model.sessions[model.selected],
+// and keeping the dispatch as "lookup action, then match in update.rs"
+// lets each action pull exactly what it needs. The compiler's
+// exhaustiveness check then catches drift if a new action is added
+// without a handler.
 
-#[derive(Clone, Copy)]
-pub enum Trigger {
-    /// A single byte matched in the parser's Normal state.
-    Byte(u8),
-    /// An ESC [ <byte> sequence (e.g., arrow keys).
-    EscBracket(u8),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NormalAction {
+    SelectPrev,
+    SelectNext,
+    AttachSelected,
+    NewSession,
+    KillSelected,
+    Quit,
 }
 
 pub struct Binding {
     pub label: &'static str,
     pub description: &'static str,
-    pub mappings: &'static [(Trigger, Key)],
+    /// Every Key that triggers this action. Listed explicitly — no
+    /// case-folding at lookup time — so a new case-distinct binding
+    /// is a pure data change.
+    pub keys: &'static [Key],
+    pub action: NormalAction,
 }
 
 pub const NORMAL_BINDINGS: &[Binding] = &[
     Binding {
         label: "j",
         description: "down",
-        mappings: &[
-            (Trigger::EscBracket(b'B'), Key::Down),
-            (Trigger::Byte(b'j'), Key::Down),
-        ],
+        keys: &[Key::Down, Key::Char(b'j'), Key::Char(b'J')],
+        action: NormalAction::SelectNext,
     },
     Binding {
         label: "k",
         description: "up",
-        mappings: &[
-            (Trigger::EscBracket(b'A'), Key::Up),
-            (Trigger::Byte(b'k'), Key::Up),
-        ],
+        keys: &[Key::Up, Key::Char(b'k'), Key::Char(b'K')],
+        action: NormalAction::SelectPrev,
     },
     Binding {
         label: "spc",
         description: "attach",
-        mappings: &[
-            (Trigger::Byte(b' '), Key::Enter),
-            (Trigger::Byte(b'\r'), Key::Enter),
-            (Trigger::Byte(b'\n'), Key::Enter),
-        ],
+        keys: &[Key::Char(b' '), Key::Enter],
+        action: NormalAction::AttachSelected,
     },
     Binding {
         label: "n",
         description: "new",
-        mappings: &[(Trigger::Byte(b'n'), Key::NewSession)],
+        keys: &[Key::Char(b'n'), Key::Char(b'N')],
+        action: NormalAction::NewSession,
     },
     Binding {
         label: "d",
         description: "kill",
-        mappings: &[(Trigger::Byte(b'd'), Key::KillSession)],
+        keys: &[Key::Char(b'd'), Key::Char(b'D')],
+        action: NormalAction::KillSelected,
     },
     Binding {
         label: "q",
         description: "quit",
-        mappings: &[(Trigger::Byte(b'q'), Key::Quit), (Trigger::Byte(0x03), Key::Quit)],
+        // Ctrl-C (0x03) is a global-quit convention. Enumerating it
+        // here rather than special-casing in dispatch keeps the
+        // single-source-of-truth story intact.
+        keys: &[Key::Char(b'q'), Key::Char(b'Q'), Key::Ctrl(0x03)],
+        action: NormalAction::Quit,
     },
 ];
 
 /// Footer hints for create mode. The actual byte handling lives in
-/// process_create_input; these just keep the display in sync.
+/// update.rs's create handler; these just keep the display in sync.
 pub const CREATE_HINTS: &[(&str, &str)] = &[("ret", "create"), ("esc", "cancel")];
 pub const CONFIRM_KILL_HINTS: &[(&str, &str)] = &[("y", "confirm"), ("n", "cancel")];
 pub const CONFIRM_FORCE_HINTS: &[(&str, &str)] = &[("y", "force"), ("n", "cancel")];
 
-// Precomputed dispatch tables so per-byte key lookup is O(1). Built
-// lazily from NORMAL_BINDINGS on first use.
-fn byte_key(b: u8) -> Option<Key> {
-    static T: std::sync::OnceLock<[Option<Key>; 256]> = std::sync::OnceLock::new();
-    T.get_or_init(|| build_table(|t| matches!(t, Trigger::Byte(_)), |t| match t {
-        Trigger::Byte(v) => v,
-        _ => unreachable!(),
-    }))[b as usize]
-}
-
-fn csi_key(b: u8) -> Option<Key> {
-    static T: std::sync::OnceLock<[Option<Key>; 256]> = std::sync::OnceLock::new();
-    T.get_or_init(|| build_table(|t| matches!(t, Trigger::EscBracket(_)), |t| match t {
-        Trigger::EscBracket(v) => v,
-        _ => unreachable!(),
-    }))[b as usize]
-}
-
-fn build_table(
-    matches: impl Fn(&Trigger) -> bool,
-    key_of: impl Fn(Trigger) -> u8,
-) -> [Option<Key>; 256] {
-    let mut arr = [None; 256];
-    for binding in NORMAL_BINDINGS {
-        for (trig, key) in binding.mappings {
-            if matches(trig) {
-                arr[key_of(*trig) as usize] = Some(*key);
-            }
-        }
-    }
-    arr
-}
-
-/// Map a token to a normal-mode Key, for the Normal-mode handler.
-/// Tokens that don't map to any binding become Key::Other.
-pub fn token_to_key(token: Token) -> Key {
-    match token {
-        Token::Byte(b) => byte_key(b.to_ascii_lowercase()).unwrap_or(Key::Other),
-        Token::Csi(b) => csi_key(b).unwrap_or(Key::Other),
-        Token::BareEsc => Key::Other,
-    }
+/// Look up which NormalAction (if any) a given Key triggers.
+/// Linear scan; the table is ~20 entries and this runs at most once
+/// per keystroke, so a HashMap would be over-engineering.
+pub fn normal_action(key: Key) -> Option<NormalAction> {
+    NORMAL_BINDINGS.iter().find(|b| b.keys.contains(&key)).map(|b| b.action)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
-    fn token_to_key_maps_bindings() {
-        assert_eq!(token_to_key(Token::Csi(b'A')), Key::Up);
-        assert_eq!(token_to_key(Token::Csi(b'B')), Key::Down);
-        assert_eq!(token_to_key(Token::Byte(b'q')), Key::Quit);
-        assert_eq!(token_to_key(Token::Byte(b'Q')), Key::Quit); // case fold
-        assert_eq!(token_to_key(Token::Byte(b'n')), Key::NewSession);
-        assert_eq!(token_to_key(Token::Byte(b'j')), Key::Down);
-        assert_eq!(token_to_key(Token::BareEsc), Key::Other);
-        assert_eq!(token_to_key(Token::Csi(b'Z')), Key::Other);
+    fn normal_action_maps_bindings() {
+        assert_eq!(normal_action(Key::Up), Some(NormalAction::SelectPrev));
+        assert_eq!(normal_action(Key::Down), Some(NormalAction::SelectNext));
+        assert_eq!(normal_action(Key::Enter), Some(NormalAction::AttachSelected));
+        assert_eq!(normal_action(Key::Char(b' ')), Some(NormalAction::AttachSelected));
+        assert_eq!(normal_action(Key::Char(b'q')), Some(NormalAction::Quit));
+        assert_eq!(normal_action(Key::Char(b'Q')), Some(NormalAction::Quit));
+        assert_eq!(normal_action(Key::Ctrl(0x03)), Some(NormalAction::Quit));
+        assert_eq!(normal_action(Key::Char(b'n')), Some(NormalAction::NewSession));
+        assert_eq!(normal_action(Key::Char(b'd')), Some(NormalAction::KillSelected));
+        assert_eq!(normal_action(Key::Char(b'j')), Some(NormalAction::SelectNext));
+        assert_eq!(normal_action(Key::Char(b'k')), Some(NormalAction::SelectPrev));
+        assert_eq!(normal_action(Key::Esc), None);
+        assert_eq!(normal_action(Key::Other), None);
+    }
+
+    /// Guard against drift: if a new binding accidentally re-uses a
+    /// key already claimed by an existing binding, `normal_action`'s
+    /// linear scan would silently dispatch to whichever comes first
+    /// and the new binding would never fire. Catch that at test time.
+    #[test]
+    fn no_key_bound_to_multiple_actions() {
+        let mut claimed: HashMap<Key, &'static str> = HashMap::new();
+        for b in NORMAL_BINDINGS {
+            for &k in b.keys {
+                if let Some(existing) = claimed.insert(k, b.label) {
+                    panic!(
+                        "key {:?} is bound by both [{}] and [{}] — \
+                         NORMAL_BINDINGS entries must have disjoint keys",
+                        k, existing, b.label,
+                    );
+                }
+            }
+        }
     }
 }

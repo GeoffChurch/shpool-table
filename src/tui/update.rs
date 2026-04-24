@@ -1,6 +1,6 @@
-use super::keymap::{token_to_key, Key};
+use super::keymap::{normal_action, Key, NormalAction};
 use super::model::{Mode, Model};
-use super::parser::{InputParser, Token};
+use super::parser::InputParser;
 
 #[derive(Debug, PartialEq)]
 pub enum LoopAction {
@@ -27,87 +27,84 @@ pub fn process_input(
 ) -> Option<LoopAction> {
     // Any keypress dismisses a pending error — the user has now seen it.
     model.error = None;
-    let mut tokens = Vec::with_capacity(buf.len());
-    parser.feed(buf, &mut tokens);
+    let mut keys = Vec::with_capacity(buf.len());
+    parser.feed(buf, &mut keys);
     match model.mode {
-        Mode::Normal => process_normal(&tokens, model),
-        Mode::CreateInput(_) => process_create_input(&tokens, model),
-        Mode::ConfirmKill(_) => process_confirm_kill(&tokens, model),
-        Mode::ConfirmForce(_) => process_confirm_force(&tokens, model),
+        Mode::Normal => process_normal(&keys, model),
+        Mode::CreateInput(_) => process_create_input(&keys, model),
+        Mode::ConfirmKill(_) => process_confirm_kill(&keys, model),
+        Mode::ConfirmForce(_) => process_confirm_force(&keys, model),
     }
 }
 
-fn process_normal(tokens: &[Token], model: &mut Model) -> Option<LoopAction> {
-    for &t in tokens {
-        match token_to_key(t) {
-            Key::Up => model.select_prev(),
-            Key::Down => model.select_next(),
-            Key::Enter => {
+fn process_normal(keys: &[Key], model: &mut Model) -> Option<LoopAction> {
+    for &k in keys {
+        let Some(action) = normal_action(k) else { continue };
+        match action {
+            NormalAction::SelectPrev => model.select_prev(),
+            NormalAction::SelectNext => model.select_next(),
+            NormalAction::AttachSelected => {
                 if let Some(name) = model.selected_name() {
                     return Some(LoopAction::Attach(name.to_string()));
                 }
             }
-            Key::NewSession => {
+            NormalAction::NewSession => {
                 model.mode = Mode::CreateInput(String::new());
                 return None;
             }
-            Key::KillSession => {
+            NormalAction::KillSelected => {
                 if let Some(name) = model.selected_name() {
                     model.mode = Mode::ConfirmKill(name.to_string());
                 }
                 return None;
             }
-            Key::Quit => return Some(LoopAction::Quit),
-            Key::Other => {}
+            NormalAction::Quit => return Some(LoopAction::Quit),
         }
     }
     None
 }
 
-fn process_create_input(tokens: &[Token], model: &mut Model) -> Option<LoopAction> {
-    for &t in tokens {
-        match t {
-            Token::BareEsc => {
+fn process_create_input(keys: &[Key], model: &mut Model) -> Option<LoopAction> {
+    for &k in keys {
+        match k {
+            // Esc and Ctrl-C both cancel. Ctrl-C is a reflexive cancel
+            // in most interactive tools; making it equivalent here
+            // means the user never gets stuck in the modal mid-typing.
+            Key::Esc | Key::Ctrl(0x03) => {
                 model.mode = Mode::Normal;
                 return None;
             }
-            Token::Csi(_) => {} // arrow keys etc. are ignored in this mode
-            Token::Byte(b) => match b {
-                0x03 => {
-                    model.mode = Mode::Normal;
-                    return None;
-                }
-                0x0d | 0x0a => {
-                    if let Mode::CreateInput(ref name) = model.mode {
-                        if !name.is_empty() {
-                            let name = name.clone();
-                            model.mode = Mode::Normal;
-                            return Some(LoopAction::Create(name));
-                        }
+            Key::Enter => {
+                if let Mode::CreateInput(ref name) = model.mode {
+                    if !name.is_empty() {
+                        let name = name.clone();
+                        model.mode = Mode::Normal;
+                        return Some(LoopAction::Create(name));
                     }
                 }
-                0x7f | 0x08 => {
-                    if let Mode::CreateInput(ref mut name) = model.mode {
-                        name.pop();
-                    }
+            }
+            Key::Backspace => {
+                if let Mode::CreateInput(ref mut name) = model.mode {
+                    name.pop();
                 }
-                // Printable non-space ASCII (shpool rejects whitespace in names).
-                0x21..=0x7e => {
-                    if let Mode::CreateInput(ref mut name) = model.mode {
-                        name.push(b as char);
-                    }
+            }
+            // Printable non-space ASCII (shpool rejects whitespace in names).
+            // The decoder already rejected non-ASCII bytes (→ Key::Other).
+            Key::Char(b) if b != b' ' => {
+                if let Mode::CreateInput(ref mut name) = model.mode {
+                    name.push(b as char);
                 }
-                _ => {}
-            },
+            }
+            _ => {}
         }
     }
     None
 }
 
-fn process_confirm_kill(tokens: &[Token], model: &mut Model) -> Option<LoopAction> {
-    for &t in tokens {
-        match t {
-            Token::Byte(b'y') | Token::Byte(b'Y') => {
+fn process_confirm_kill(keys: &[Key], model: &mut Model) -> Option<LoopAction> {
+    for &k in keys {
+        match k {
+            Key::Char(b'y') | Key::Char(b'Y') => {
                 if let Mode::ConfirmKill(ref name) = model.mode {
                     let name = name.clone();
                     model.mode = Mode::Normal;
@@ -123,10 +120,10 @@ fn process_confirm_kill(tokens: &[Token], model: &mut Model) -> Option<LoopActio
     None
 }
 
-fn process_confirm_force(tokens: &[Token], model: &mut Model) -> Option<LoopAction> {
-    for &t in tokens {
-        match t {
-            Token::Byte(b'y') | Token::Byte(b'Y') => {
+fn process_confirm_force(keys: &[Key], model: &mut Model) -> Option<LoopAction> {
+    for &k in keys {
+        match k {
+            Key::Char(b'y') | Key::Char(b'Y') => {
                 if let Mode::ConfirmForce(ref name) = model.mode {
                     let name = name.clone();
                     model.mode = Mode::Normal;
