@@ -6,9 +6,60 @@ use std::io::{self, BufWriter, Write};
 use std::process;
 
 use anyhow::{Context, Result};
+use clap::Parser;
 
 use crate::session::{ListReply, Session};
 use crate::tui::{Command, Event, Input, InputParser, Model};
+
+/// Top-level flags, forwarded verbatim to every `shpool` shell-out
+/// (list, kill, attach). Mirrors shpool's own top-level flags so that
+/// `shpool-table --config-file foo.toml` behaves like
+/// `shpool --config-file foo.toml list` etc.
+///
+/// `--daemonize` / `--no-daemonize` are deliberately not included —
+/// auto-launching a daemon from under the TUI (especially mid-session)
+/// is confusing UX. A future in-TUI "start daemon" action is the
+/// planned way to address that need.
+#[derive(Parser, Debug, Clone, Default)]
+#[command(about = "A TUI session manager that wraps shpool.", version)]
+struct Flags {
+    /// Forwarded to every `shpool` invocation as `--config-file <path>`.
+    #[arg(long, value_name = "PATH")]
+    config_file: Option<String>,
+
+    /// Forwarded as `--log-file <path>`.
+    #[arg(long, value_name = "PATH")]
+    log_file: Option<String>,
+
+    /// Increase verbosity. Forwarded as `-v` (repeatable).
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8,
+
+    /// Forwarded as `--socket <path>`.
+    #[arg(long, value_name = "PATH")]
+    socket: Option<String>,
+}
+
+impl Flags {
+    /// Prepend forwardable flags to a `shpool` Command, before its
+    /// subcommand. Clap requires global flags to appear before the
+    /// subcommand, so callers must apply these *before* `.arg("list")`
+    /// / `.arg("attach")` / etc.
+    fn apply(&self, cmd: &mut process::Command) {
+        if let Some(p) = &self.config_file {
+            cmd.args(["--config-file", p]);
+        }
+        if let Some(p) = &self.log_file {
+            cmd.args(["--log-file", p]);
+        }
+        for _ in 0..self.verbose {
+            cmd.arg("-v");
+        }
+        if let Some(p) = &self.socket {
+            cmd.args(["--socket", p]);
+        }
+    }
+}
 
 /// Current wall-clock time in unix milliseconds. Passed into `render`
 /// so the relative-age columns have a deterministic `now` (tests pass
@@ -18,8 +69,10 @@ fn now_unix_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
-fn fetch_sessions() -> Result<Vec<Session>> {
-    let out = process::Command::new("shpool")
+fn fetch_sessions(flags: &Flags) -> Result<Vec<Session>> {
+    let mut cmd = process::Command::new("shpool");
+    flags.apply(&mut cmd);
+    let out = cmd
         .args(["list", "--json"])
         .output()
         .context("running `shpool list --json`")?;
@@ -33,6 +86,7 @@ fn fetch_sessions() -> Result<Vec<Session>> {
 }
 
 fn main() -> Result<()> {
+    let flags = Flags::parse();
     if let Ok(inside) = std::env::var("SHPOOL_SESSION_NAME") {
         // Nested sessions get messy: a force-attach to the outer
         // session bumps us off, sessions created from here inherit
@@ -45,13 +99,15 @@ fn main() -> Result<()> {
              to manage sessions. Current list:\n"
         );
         use std::os::unix::process::CommandExt;
-        let err = process::Command::new("shpool").arg("list").exec();
+        let mut cmd = process::Command::new("shpool");
+        flags.apply(&mut cmd);
+        let err = cmd.arg("list").exec();
         anyhow::bail!("exec shpool list: {err}");
     }
-    run_tui()
+    run_tui(&flags)
 }
 
-fn run_tui() -> Result<()> {
+fn run_tui(flags: &Flags) -> Result<()> {
     tty::install_sigwinch_handler().context("installing SIGWINCH handler")?;
 
     let mut model = Model::new(Vec::new());
@@ -66,7 +122,7 @@ fn run_tui() -> Result<()> {
     tty::enter_alt_screen(&mut out)?;
 
     // Ensure we leave alt-screen even on error returns from main_loop.
-    let result = main_loop(&mut model, &mut parser, &mut out, &raw);
+    let result = main_loop(&mut model, &mut parser, &mut out, &raw, flags);
 
     let _ = tty::leave_alt_screen(&mut out);
     let _ = out.flush();
@@ -83,15 +139,16 @@ fn main_loop<W: Write>(
     parser: &mut InputParser,
     out: &mut W,
     raw: &tty::RawMode,
+    flags: &Flags,
 ) -> Result<()> {
     // Initial fetch: if the daemon is up, show its list immediately;
     // if not, the RefreshFailed event surfaces the error in the footer
     // and the user can retry (or quit).
-    let initial = match fetch_sessions() {
+    let initial = match fetch_sessions(flags) {
         Ok(s) => Event::SessionsRefreshed(s),
         Err(e) => Event::RefreshFailed(format!("{e}")),
     };
-    run_cascade(model, initial, out, raw)?;
+    run_cascade(model, initial, out, raw, flags)?;
 
     let mut buf = [0u8; 16];
     loop {
@@ -126,7 +183,7 @@ fn main_loop<W: Write>(
                         Input::Key(k) => Event::Key(k),
                         Input::FocusGained => Event::FocusGained,
                     };
-                    run_cascade(model, event, out, raw)?;
+                    run_cascade(model, event, out, raw, flags)?;
                     if model.quit {
                         break;
                     }
@@ -155,10 +212,11 @@ fn run_cascade<W: Write>(
     event: Event,
     out: &mut W,
     raw: &tty::RawMode,
+    flags: &Flags,
 ) -> Result<()> {
     let mut next = tui::update(model, event);
     while let Some(cmd) = next.take() {
-        let follow_up = execute(cmd, model, out, raw)?;
+        let follow_up = execute(cmd, model, out, raw, flags)?;
         let Some(ev) = follow_up else { break };
         next = tui::update(model, ev);
     }
@@ -174,6 +232,7 @@ fn execute<W: Write>(
     model: &mut Model,
     out: &mut W,
     raw: &tty::RawMode,
+    flags: &Flags,
 ) -> Result<Option<Event>> {
     match cmd {
         Command::Quit => {
@@ -181,13 +240,13 @@ fn execute<W: Write>(
             Ok(None)
         }
         Command::Refresh => {
-            let ev = match fetch_sessions() {
+            let ev = match fetch_sessions(flags) {
                 Ok(sessions) => Event::SessionsRefreshed(sessions),
                 Err(e) => Event::RefreshFailed(format!("{e}")),
             };
             Ok(Some(ev))
         }
-        Command::Attach { name, force } => match preflight_attach(&name, force) {
+        Command::Attach { name, force } => match preflight_attach(&name, force, flags) {
             Preflight::RefreshFailed(e) => {
                 // Route through Event::RefreshFailed so the
                 // "shpool list:" prefix lives in exactly one place
@@ -206,8 +265,7 @@ fn execute<W: Write>(
                 Ok(Some(Event::SessionsRefreshed(sessions)))
             }
             Preflight::ClearToAttach => {
-                let ok =
-                    with_tui_suspended(out, raw, || shell_attach(&name, force))?;
+                let ok = with_tui_suspended(out, raw, || shell_attach(&name, force, flags))?;
                 Ok(Some(Event::AttachExited { ok, name }))
             }
         },
@@ -215,12 +273,11 @@ fn execute<W: Write>(
             // Duplicate-name check happened in update; by here it's
             // safe to spawn. `shpool attach` with a new name creates
             // atomically on the daemon side.
-            let ok =
-                with_tui_suspended(out, raw, || shell_attach(&name, false))?;
+            let ok = with_tui_suspended(out, raw, || shell_attach(&name, false, flags))?;
             Ok(Some(Event::AttachExited { ok, name }))
         }
         Command::Kill(name) => {
-            let (ok, err) = shell_kill(&name)?;
+            let (ok, err) = shell_kill(&name, flags)?;
             Ok(Some(Event::KillFinished { ok, name, err }))
         }
     }
@@ -248,8 +305,8 @@ enum Preflight {
     ClearToAttach,
 }
 
-fn preflight_attach(name: &str, force: bool) -> Preflight {
-    let sessions = match fetch_sessions() {
+fn preflight_attach(name: &str, force: bool, flags: &Flags) -> Preflight {
+    let sessions = match fetch_sessions(flags) {
         Ok(s) => s,
         Err(e) => return Preflight::RefreshFailed(e),
     };
@@ -267,8 +324,9 @@ fn preflight_attach(name: &str, force: bool) -> Preflight {
 /// Spawn `shpool attach [-f] <name>` and block until it exits.
 /// The caller (`with_tui_suspended`) is responsible for putting the
 /// terminal into cooked mode + primary screen first.
-fn shell_attach(name: &str, force: bool) -> Result<bool> {
+fn shell_attach(name: &str, force: bool, flags: &Flags) -> Result<bool> {
     let mut cmd = process::Command::new("shpool");
+    flags.apply(&mut cmd);
     cmd.arg("attach");
     if force {
         cmd.arg("-f");
@@ -282,8 +340,10 @@ fn shell_attach(name: &str, force: bool) -> Result<bool> {
 /// Returns (ok, err_message). Shell-out errors (couldn't even spawn
 /// shpool) propagate; non-zero exit with a stderr payload comes back
 /// as `ok=false` + `err=Some(detail)`.
-fn shell_kill(name: &str) -> Result<(bool, Option<String>)> {
-    let output = process::Command::new("shpool")
+fn shell_kill(name: &str, flags: &Flags) -> Result<(bool, Option<String>)> {
+    let mut cmd = process::Command::new("shpool");
+    flags.apply(&mut cmd);
+    let output = cmd
         .args(["kill", name])
         .output()
         .context("running `shpool kill`")?;
@@ -300,6 +360,68 @@ fn shell_kill(name: &str) -> Result<(bool, Option<String>)> {
         }
     };
     Ok((ok, err))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args_of(cmd: &process::Command) -> Vec<String> {
+        cmd.get_args().map(|s| s.to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn flags_apply_nothing_when_default() {
+        let flags = Flags::default();
+        let mut cmd = process::Command::new("shpool");
+        flags.apply(&mut cmd);
+        assert!(args_of(&cmd).is_empty());
+    }
+
+    #[test]
+    fn flags_apply_all_fields() {
+        let flags = Flags {
+            config_file: Some("/etc/shpool/custom.toml".into()),
+            log_file: Some("/var/log/shpool.log".into()),
+            verbose: 2,
+            socket: Some("/tmp/shpool.sock".into()),
+        };
+        let mut cmd = process::Command::new("shpool");
+        flags.apply(&mut cmd);
+        let args = args_of(&cmd);
+        // Exact order + presence check. Duplicated -v for verbose=2.
+        assert_eq!(
+            args,
+            vec![
+                "--config-file", "/etc/shpool/custom.toml",
+                "--log-file", "/var/log/shpool.log",
+                "-v", "-v",
+                "--socket", "/tmp/shpool.sock",
+            ],
+        );
+    }
+
+    #[test]
+    fn flags_precede_subcommand() {
+        // clap requires global flags to appear before the subcommand.
+        // Apply flags first, then the subcommand: the subcommand must
+        // end up after every forwarded flag.
+        let flags = Flags {
+            config_file: Some("/c".into()),
+            log_file: Some("/l".into()),
+            verbose: 1,
+            socket: Some("/s".into()),
+        };
+        let mut cmd = process::Command::new("shpool");
+        flags.apply(&mut cmd);
+        cmd.args(["list", "--json"]);
+        let args = args_of(&cmd);
+        let list_pos = args.iter().position(|a| a == "list").expect("list present");
+        for flag in ["--config-file", "--log-file", "-v", "--socket"] {
+            let pos = args.iter().position(|a| a == flag).expect(flag);
+            assert!(pos < list_pos, "{flag} must come before `list`; got {args:?}");
+        }
+    }
 }
 
 /// Tear the TUI down (leave alt-screen, cooked mode), run `f`, then
