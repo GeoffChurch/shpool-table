@@ -6,6 +6,10 @@
 
 #[derive(Debug, PartialEq)]
 pub enum Command {
+    /// Refetch the session list. Result comes back as
+    /// Event::SessionsRefreshed or Event::RefreshFailed.
+    Refresh,
+
     /// Spawn `shpool attach [-f] <name>` as a child process. `force`
     /// passes `-f` through — reached either from a plain attach or
     /// from the ConfirmForce prompt.

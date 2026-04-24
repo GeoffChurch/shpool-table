@@ -26,6 +26,33 @@ impl RawMode {
         }
         Ok(RawMode { saved })
     }
+
+    /// Temporarily restore the saved (cooked) terminal settings.
+    /// Pair with `resume` — used by suspend-TUI so child processes
+    /// (`shpool attach`) see a cooked terminal, then we restore raw
+    /// mode when they exit.
+    pub fn suspend(&self) -> Result<()> {
+        let rc = unsafe {
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.saved)
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error()).context("tcsetattr cooked");
+        }
+        Ok(())
+    }
+
+    /// Re-apply raw mode after a `suspend`. Symmetric with `enter`
+    /// but reuses the saved termios from construction rather than
+    /// re-reading it.
+    pub fn resume(&self) -> Result<()> {
+        let mut raw = self.saved;
+        unsafe { libc::cfmakeraw(&mut raw) };
+        let rc = unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error()).context("tcsetattr raw");
+        }
+        Ok(())
+    }
 }
 
 impl Drop for RawMode {

@@ -15,11 +15,22 @@ pub struct Model {
     /// Transient error message displayed in the bottom bar until the
     /// next keypress. Set by failed shell-outs and pre-flight checks.
     pub error: Option<String>,
+    /// Set by Command::Quit's executor. The main loop checks this
+    /// after each render and exits if true. A flag rather than a
+    /// loop-break return so the cascade can produce other commands
+    /// around a Quit without losing them.
+    pub quit: bool,
 }
 
 impl Model {
     pub fn new(sessions: Vec<Session>) -> Self {
-        Self { sessions, selected: 0, mode: Mode::Normal, error: None }
+        Self {
+            sessions,
+            selected: 0,
+            mode: Mode::Normal,
+            error: None,
+            quit: false,
+        }
     }
 
     pub fn set_error(&mut self, msg: impl Into<String>) {
