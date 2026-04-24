@@ -221,11 +221,6 @@ fn clip_styled(styled: &str, max_visible: usize) -> String {
     out
 }
 
-fn now_unix_ms() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
-}
-
 /// Render a unix-ms timestamp as a short relative-to-now string:
 /// "now" for the first 5 seconds, then "Ns", "Nm", "Nh", "Nd".
 fn format_age(now_ms: u64, then_ms: u64) -> String {
@@ -251,6 +246,7 @@ pub fn render(
     model: &Model,
     width: u16,
     height: u16,
+    now_ms: u64,
     out: &mut impl Write,
 ) -> io::Result<()> {
     let w = width as usize;
@@ -288,7 +284,7 @@ pub fn render(
     if model.sessions.is_empty() {
         out.write_all(b"  (no sessions)\r\n")?;
     } else {
-        let now = now_unix_ms();
+        let now = now_ms;
         let max_visible = (height as usize).saturating_sub(CHROME_LINES);
         let (start, end) = viewport(model.sessions.len(), model.selected, max_visible);
 
@@ -348,6 +344,105 @@ fn viewport(total: usize, selected: usize, max_visible: usize) -> (usize, usize)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::Session;
+
+    // Fixed "now" used by the snapshot tests so relative-age columns
+    // are deterministic. 2026-01-15 22:30 UTC.
+    const NOW_MS: u64 = 1_768_552_200_000;
+
+    fn sess(name: &str, attached: bool, last_active_ms: u64) -> Session {
+        Session {
+            name: name.to_string(),
+            attached,
+            started_at_unix_ms: last_active_ms,
+            last_connected_at_unix_ms: last_active_ms,
+            last_disconnected_at_unix_ms: None,
+        }
+    }
+
+    /// Render `model` into a string with ANSI CSI sequences stripped
+    /// and `\r\n` line endings normalized to `\n`. Snapshot files then
+    /// contain plain characters — reviewable diffs that don't require
+    /// mentally parsing SGR codes.
+    fn render_visible(model: &Model, w: u16, h: u16) -> String {
+        let mut out = Vec::new();
+        render(model, w, h, NOW_MS, &mut out).unwrap();
+        let raw = String::from_utf8(out).unwrap();
+        strip_ansi(&raw)
+    }
+
+    /// Strip CSI escape sequences from `styled`, dropping `\r` so
+    /// CRLF collapses to LF. Same state machine as `clip_styled`
+    /// above, but discards the styling rather than preserving it.
+    fn strip_ansi(styled: &str) -> String {
+        let mut out = String::new();
+        // 0 = normal, 1 = saw ESC, 2 = inside CSI params (drop until final).
+        let mut esc = 0u8;
+        for ch in styled.chars() {
+            match esc {
+                0 => {
+                    if ch == '\x1b' {
+                        esc = 1;
+                    } else if ch != '\r' {
+                        out.push(ch);
+                    }
+                }
+                1 => {
+                    esc = if ch == '[' { 2 } else { 0 };
+                }
+                _ => {
+                    if matches!(ch as u32, 0x40..=0x7e) {
+                        esc = 0;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn empty_list_shows_hint() {
+        let m = Model::new(vec![]);
+        insta::assert_snapshot!(render_visible(&m, 60, 6));
+    }
+
+    #[test]
+    fn list_with_selection() {
+        let mut m = Model::new(vec![
+            sess("main", true, NOW_MS - 2 * 60 * 1000),
+            sess("build", false, NOW_MS - 3 * 60 * 60 * 1000),
+        ]);
+        m.selected = 1;
+        insta::assert_snapshot!(render_visible(&m, 70, 6));
+    }
+
+    #[test]
+    fn confirm_kill_footer() {
+        let mut m = Model::new(vec![sess("main", false, NOW_MS - 10 * 60 * 1000)]);
+        m.mode = Mode::ConfirmKill("main".into());
+        insta::assert_snapshot!(render_visible(&m, 70, 5));
+    }
+
+    #[test]
+    fn confirm_force_footer() {
+        let mut m = Model::new(vec![sess("main", true, NOW_MS - 5 * 60 * 1000)]);
+        m.mode = Mode::ConfirmForce("main".into());
+        insta::assert_snapshot!(render_visible(&m, 70, 5));
+    }
+
+    #[test]
+    fn create_input_midtyping() {
+        let mut m = Model::new(vec![sess("main", false, NOW_MS - 30 * 1000)]);
+        m.mode = Mode::CreateInput("foo".into());
+        insta::assert_snapshot!(render_visible(&m, 70, 5));
+    }
+
+    #[test]
+    fn error_replaces_footer() {
+        let mut m = Model::new(vec![sess("main", false, NOW_MS - 30 * 1000)]);
+        m.set_error("daemon gone");
+        insta::assert_snapshot!(render_visible(&m, 60, 5));
+    }
 
     #[test]
     fn viewport_fits() {

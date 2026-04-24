@@ -10,6 +10,14 @@ use anyhow::{Context, Result};
 use crate::session::{ListReply, Session};
 use crate::tui::{Command, Event, InputParser, Model};
 
+/// Current wall-clock time in unix milliseconds. Passed into `render`
+/// so the relative-age columns have a deterministic `now` (tests pass
+/// a fixed value; production passes the current time).
+fn now_unix_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
 fn fetch_sessions() -> Result<Vec<Session>> {
     let out = process::Command::new("shpool")
         .args(["list", "--json"])
@@ -88,7 +96,7 @@ fn main_loop<W: Write>(
     let mut buf = [0u8; 16];
     loop {
         let (w, h) = tty::tty_size().unwrap_or((80, 24));
-        tui::render(model, w, h, out)?;
+        tui::render(model, w, h, now_unix_ms(), out)?;
         out.flush()?;
 
         // `quit` is checked AFTER the draw, not before. The final

@@ -1,0 +1,9 @@
+---
+source: src/tui/view.rs
+assertion_line: 437
+expression: "render_visible(&m, 70, 5)"
+---
+                          shpool (1 session)                          
+  name  created  active                                               
+ >main  30s      30s                                                  
+  new session: foo_   (ret: create, esc: cancel)

@@ -1,0 +1,9 @@
+---
+source: src/tui/view.rs
+assertion_line: 444
+expression: "render_visible(&m, 60, 5)"
+---
+                     shpool (1 session)                     
+  name  created  active                                     
+ >main  30s      30s                                        
+  ! daemon gone

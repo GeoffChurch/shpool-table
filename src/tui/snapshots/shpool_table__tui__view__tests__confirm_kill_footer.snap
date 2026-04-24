@@ -1,0 +1,9 @@
+---
+source: src/tui/view.rs
+assertion_line: 423
+expression: "render_visible(&m, 70, 5)"
+---
+                          shpool (1 session)                          
+  name  created  active                                               
+ >main  10m      10m                                                  
+  kill "main"?   (y: confirm, n: cancel)

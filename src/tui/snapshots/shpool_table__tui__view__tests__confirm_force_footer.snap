@@ -1,0 +1,9 @@
+---
+source: src/tui/view.rs
+assertion_line: 430
+expression: "render_visible(&m, 70, 5)"
+---
+                          shpool (1 session)                          
+  name  created  active                                               
+*>main  5m       5m                                                   
+  "main" already attached. force-attach?   (y: force, n: cancel)

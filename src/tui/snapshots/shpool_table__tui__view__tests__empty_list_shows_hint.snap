@@ -1,0 +1,9 @@
+---
+source: src/tui/view.rs
+assertion_line: 406
+expression: "render_visible(&m, 60, 6)"
+---
+                    shpool (0 sessions)                     
+  name  created  active                                     
+  (no sessions)
+  j down   k up   spc attach   n new   d kill   q quit
