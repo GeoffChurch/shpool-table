@@ -1,142 +1,150 @@
+//! The pure update function: `(&mut Model, Event) -> Option<Command>`.
+//!
+//! Free of I/O — no stdin reads, no shell-outs, no ANSI writes. All
+//! the dispatch policy (which key does what in which mode, when to
+//! clear the transient error, when to enter or leave a modal mode)
+//! lives here and is covered by unit tests.
+//!
+//! Side effects are expressed as `Command` return values; the main
+//! loop (src/main.rs) is responsible for executing them.
+
+use super::command::Command;
+use super::event::Event;
 use super::keymap::{normal_action, Key, NormalAction};
 use super::model::{Mode, Model};
-use super::parser::InputParser;
 
-#[derive(Debug, PartialEq)]
-pub enum LoopAction {
-    Attach(String),
-    /// Force-attach (`shpool attach -f <name>`) — bumps an existing
-    /// terminal off the session. Only reached via the ConfirmForce
-    /// prompt, which is itself only entered after the attach
-    /// pre-flight detects the session is attached elsewhere.
-    AttachForce(String),
-    /// Create (via `shpool attach <new-name>`) and immediately attach.
-    /// Distinct from Attach so the main loop can skip the
-    /// session-must-exist pre-flight check.
-    Create(String),
-    Kill(String),
-    Quit,
-}
+/// Fold one event into the model. Returns `Some(Command)` if the
+/// event triggers a side effect (attach / kill / create / quit).
+pub fn update(model: &mut Model, event: Event) -> Option<Command> {
+    // Any keystroke clears the transient error — the user has seen
+    // it now. Async events (added in a later commit) will *set* an
+    // error but won't clear one, so that messages about failed
+    // background actions don't self-dismiss.
+    let was_keystroke = matches!(event, Event::Key(_));
+    if was_keystroke {
+        model.error = None;
+    }
 
-// -- Input processing --
-
-pub fn process_input(
-    buf: &[u8],
-    model: &mut Model,
-    parser: &mut InputParser,
-) -> Option<LoopAction> {
-    // Any keypress dismisses a pending error — the user has now seen it.
-    model.error = None;
-    let mut keys = Vec::with_capacity(buf.len());
-    parser.feed(buf, &mut keys);
-    match model.mode {
-        Mode::Normal => process_normal(&keys, model),
-        Mode::CreateInput(_) => process_create_input(&keys, model),
-        Mode::ConfirmKill(_) => process_confirm_kill(&keys, model),
-        Mode::ConfirmForce(_) => process_confirm_force(&keys, model),
+    match event {
+        Event::Key(k) => handle_key(model, k),
     }
 }
 
-fn process_normal(keys: &[Key], model: &mut Model) -> Option<LoopAction> {
-    for &k in keys {
-        let Some(action) = normal_action(k) else { continue };
-        match action {
-            NormalAction::SelectPrev => model.select_prev(),
-            NormalAction::SelectNext => model.select_next(),
-            NormalAction::AttachSelected => {
-                if let Some(name) = model.selected_name() {
-                    return Some(LoopAction::Attach(name.to_string()));
-                }
-            }
-            NormalAction::NewSession => {
-                model.mode = Mode::CreateInput(String::new());
-                return None;
-            }
-            NormalAction::KillSelected => {
-                if let Some(name) = model.selected_name() {
-                    model.mode = Mode::ConfirmKill(name.to_string());
-                }
-                return None;
-            }
-            NormalAction::Quit => return Some(LoopAction::Quit),
+fn handle_key(model: &mut Model, key: Key) -> Option<Command> {
+    match &model.mode {
+        Mode::Normal => handle_key_normal(model, key),
+        Mode::CreateInput(_) => handle_key_create(model, key),
+        Mode::ConfirmKill(_) => handle_key_confirm_kill(model, key),
+        Mode::ConfirmForce(_) => handle_key_confirm_force(model, key),
+    }
+}
+
+fn handle_key_normal(model: &mut Model, key: Key) -> Option<Command> {
+    let action = normal_action(key)?;
+    match action {
+        NormalAction::SelectPrev => {
+            model.select_prev();
+            None
         }
-    }
-    None
-}
-
-fn process_create_input(keys: &[Key], model: &mut Model) -> Option<LoopAction> {
-    for &k in keys {
-        match k {
-            // Esc and Ctrl-C both cancel. Ctrl-C is a reflexive cancel
-            // in most interactive tools; making it equivalent here
-            // means the user never gets stuck in the modal mid-typing.
-            Key::Esc | Key::Ctrl(0x03) => {
-                model.mode = Mode::Normal;
-                return None;
-            }
-            Key::Enter => {
-                if let Mode::CreateInput(ref name) = model.mode {
-                    if !name.is_empty() {
-                        let name = name.clone();
-                        model.mode = Mode::Normal;
-                        return Some(LoopAction::Create(name));
-                    }
-                }
-            }
-            Key::Backspace => {
-                if let Mode::CreateInput(ref mut name) = model.mode {
-                    name.pop();
-                }
-            }
-            // Printable non-space ASCII (shpool rejects whitespace in names).
-            // The decoder already rejected non-ASCII bytes (→ Key::Other).
-            Key::Char(b) if b != b' ' => {
-                if let Mode::CreateInput(ref mut name) = model.mode {
-                    name.push(b as char);
-                }
-            }
-            _ => {}
+        NormalAction::SelectNext => {
+            model.select_next();
+            None
         }
+        NormalAction::AttachSelected => {
+            let name = model.selected_name()?.to_string();
+            // Emit Command::Attach with force=false. The executor
+            // pre-flights fresh data and may pop a ConfirmForce
+            // prompt if the session turns out to be attached
+            // elsewhere — no reason to guess from (possibly stale)
+            // model state here.
+            Some(Command::Attach { name, force: false })
+        }
+        NormalAction::NewSession => {
+            model.mode = Mode::CreateInput(String::new());
+            None
+        }
+        NormalAction::KillSelected => {
+            let name = model.selected_name()?.to_string();
+            model.mode = Mode::ConfirmKill(name);
+            None
+        }
+        NormalAction::Quit => Some(Command::Quit),
     }
-    None
 }
 
-fn process_confirm_kill(keys: &[Key], model: &mut Model) -> Option<LoopAction> {
-    for &k in keys {
-        match k {
-            Key::Char(b'y') | Key::Char(b'Y') => {
-                if let Mode::ConfirmKill(ref name) = model.mode {
-                    let name = name.clone();
-                    model.mode = Mode::Normal;
-                    return Some(LoopAction::Kill(name));
-                }
-            }
-            _ => {
-                model.mode = Mode::Normal;
-                return None;
+fn handle_key_create(model: &mut Model, key: Key) -> Option<Command> {
+    let Mode::CreateInput(buf) = &mut model.mode else {
+        return None;
+    };
+    match key {
+        // Esc and Ctrl-C both cancel — Ctrl-C is a reflexive "get me
+        // out of here" in interactive tools, and mid-typing is a
+        // common place to want to bail.
+        Key::Esc | Key::Ctrl(0x03) => {
+            model.mode = Mode::Normal;
+            None
+        }
+        Key::Enter => {
+            let name = std::mem::take(buf);
+            model.mode = Mode::Normal;
+            if name.is_empty() {
+                None
+            } else {
+                Some(Command::Create(name))
             }
         }
+        Key::Backspace => {
+            buf.pop();
+            None
+        }
+        // Printable non-space ASCII. shpool rejects whitespace in
+        // names (it ends up in env vars / prompt prefixes where
+        // spaces cause pain downstream). The decoder already
+        // filtered non-ASCII bytes to Key::Other.
+        Key::Char(b) if b != b' ' => {
+            buf.push(b as char);
+            None
+        }
+        _ => None,
     }
-    None
 }
 
-fn process_confirm_force(keys: &[Key], model: &mut Model) -> Option<LoopAction> {
-    for &k in keys {
-        match k {
-            Key::Char(b'y') | Key::Char(b'Y') => {
-                if let Mode::ConfirmForce(ref name) = model.mode {
-                    let name = name.clone();
-                    model.mode = Mode::Normal;
-                    return Some(LoopAction::AttachForce(name));
-                }
-            }
-            _ => {
-                model.mode = Mode::Normal;
-                return None;
-            }
+fn handle_key_confirm_kill(model: &mut Model, key: Key) -> Option<Command> {
+    let Mode::ConfirmKill(name) = &mut model.mode else {
+        return None;
+    };
+    match key {
+        Key::Char(b'y') | Key::Char(b'Y') => {
+            let name = std::mem::take(name);
+            model.mode = Mode::Normal;
+            Some(Command::Kill(name))
+        }
+        _ => {
+            // Any non-y keystroke cancels. Intentional — matches
+            // existing shpool-table behavior before the refactor;
+            // stricter "only n/Enter/Esc cancel" would be a UX
+            // change, not an architectural one.
+            model.mode = Mode::Normal;
+            None
         }
     }
-    None
+}
+
+fn handle_key_confirm_force(model: &mut Model, key: Key) -> Option<Command> {
+    let Mode::ConfirmForce(name) = &mut model.mode else {
+        return None;
+    };
+    match key {
+        Key::Char(b'y') | Key::Char(b'Y') => {
+            let name = std::mem::take(name);
+            model.mode = Mode::Normal;
+            Some(Command::Attach { name, force: true })
+        }
+        _ => {
+            model.mode = Mode::Normal;
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -154,165 +162,184 @@ mod tests {
         }
     }
 
+    fn key(k: Key) -> Event {
+        Event::Key(k)
+    }
+
     #[test]
-    fn process_input_navigate_and_attach() {
+    fn down_then_enter_attaches_second_session() {
         let mut m = Model::new(vec![mk("a"), mk("b"), mk("c")]);
-        let mut p = InputParser::new();
-        let input = [0x1b, b'[', b'B', 0x1b, b'[', b'B', b'\r'];
-        assert_eq!(process_input(&input, &mut m, &mut p), Some(LoopAction::Attach("c".into())));
+        assert_eq!(update(&mut m, key(Key::Down)), None);
+        assert_eq!(
+            update(&mut m, key(Key::Enter)),
+            Some(Command::Attach { name: "b".into(), force: false }),
+        );
     }
 
     #[test]
-    fn process_input_up_wraps_and_attach() {
+    fn up_wraps_and_attaches_last() {
         let mut m = Model::new(vec![mk("x"), mk("y"), mk("z")]);
-        let mut p = InputParser::new();
-        let input = [0x1b, b'[', b'A', b'\r'];
-        assert_eq!(process_input(&input, &mut m, &mut p), Some(LoopAction::Attach("z".into())));
+        assert_eq!(update(&mut m, key(Key::Up)), None);
+        assert_eq!(
+            update(&mut m, key(Key::Enter)),
+            Some(Command::Attach { name: "z".into(), force: false }),
+        );
     }
 
     #[test]
-    fn process_input_quit() {
+    fn q_quits() {
         let mut m = Model::new(vec![mk("a")]);
-        let mut p = InputParser::new();
-        assert_eq!(process_input(b"q", &mut m, &mut p), Some(LoopAction::Quit));
+        assert_eq!(update(&mut m, key(Key::Char(b'q'))), Some(Command::Quit));
     }
 
     #[test]
-    fn process_input_ctrl_c() {
+    fn ctrl_c_quits_in_normal_mode() {
         let mut m = Model::new(vec![mk("a")]);
-        let mut p = InputParser::new();
-        assert_eq!(process_input(&[0x03], &mut m, &mut p), Some(LoopAction::Quit));
+        assert_eq!(update(&mut m, key(Key::Ctrl(0x03))), Some(Command::Quit));
     }
 
     #[test]
-    fn process_input_enter_empty_list() {
+    fn enter_on_empty_list_noops() {
         let mut m = Model::new(vec![]);
-        let mut p = InputParser::new();
-        assert_eq!(process_input(b"\r", &mut m, &mut p), None);
+        assert_eq!(update(&mut m, key(Key::Enter)), None);
     }
 
     #[test]
-    fn process_input_clears_error() {
+    fn keystroke_clears_error() {
         let mut m = Model::new(vec![mk("a")]);
-        let mut p = InputParser::new();
         m.set_error("session 'a' is gone");
         assert!(m.error.is_some());
-        process_input(b"j", &mut m, &mut p);
+        update(&mut m, key(Key::Char(b'j')));
         assert!(m.error.is_none());
     }
 
     #[test]
-    fn process_input_ignores_other_keys() {
+    fn unbound_keys_in_normal_mode_are_noop() {
         let mut m = Model::new(vec![mk("a")]);
-        let mut p = InputParser::new();
-        assert_eq!(process_input(b"xyz", &mut m, &mut p), None);
+        assert_eq!(update(&mut m, key(Key::Char(b'x'))), None);
+        assert_eq!(update(&mut m, key(Key::Char(b'y'))), None);
+        assert_eq!(update(&mut m, key(Key::Char(b'z'))), None);
     }
 
     #[test]
-    fn process_input_create_flow() {
+    fn create_flow_enter_submits() {
         let mut m = Model::new(vec![mk("a")]);
-        let mut p = InputParser::new();
-        assert_eq!(process_input(b"n", &mut m, &mut p), None);
+        assert_eq!(update(&mut m, key(Key::Char(b'n'))), None);
         assert_eq!(m.mode, Mode::CreateInput(String::new()));
+        update(&mut m, key(Key::Char(b'f')));
+        update(&mut m, key(Key::Char(b'o')));
+        update(&mut m, key(Key::Char(b'o')));
         assert_eq!(
-            process_input(b"foo\r", &mut m, &mut p),
-            Some(LoopAction::Create("foo".into()))
+            update(&mut m, key(Key::Enter)),
+            Some(Command::Create("foo".into()))
         );
         assert_eq!(m.mode, Mode::Normal);
     }
 
     #[test]
-    fn process_input_create_cancel() {
-        let mut m = Model::new(vec![mk("a")]);
-        let mut p = InputParser::new();
-        assert_eq!(process_input(b"n", &mut m, &mut p), None);
-        assert_eq!(process_input(b"bar\x1b", &mut m, &mut p), None);
-        assert_eq!(m.mode, Mode::Normal);
-    }
-
-    #[test]
-    fn process_input_create_backspace() {
-        let mut m = Model::new(vec![mk("a")]);
-        let mut p = InputParser::new();
-        assert_eq!(process_input(b"n", &mut m, &mut p), None);
-        assert_eq!(
-            process_input(b"ab\x7fc\r", &mut m, &mut p),
-            Some(LoopAction::Create("ac".into()))
-        );
-    }
-
-    #[test]
-    fn process_input_create_reject_empty() {
-        let mut m = Model::new(vec![mk("a")]);
-        let mut p = InputParser::new();
-        assert_eq!(process_input(b"n", &mut m, &mut p), None);
-        assert_eq!(process_input(b"\r", &mut m, &mut p), None);
-        assert_eq!(m.mode, Mode::CreateInput(String::new()));
-    }
-
-    #[test]
-    fn process_input_create_rejects_spaces() {
-        let mut m = Model::new(vec![mk("a")]);
-        let mut p = InputParser::new();
-        assert_eq!(process_input(b"n", &mut m, &mut p), None);
-        assert_eq!(
-            process_input(b"a b\r", &mut m, &mut p),
-            Some(LoopAction::Create("ab".into()))
-        );
-    }
-
-    #[test]
-    fn process_input_kill_confirm() {
-        let mut m = Model::new(vec![mk("a"), mk("b")]);
-        let mut p = InputParser::new();
-        assert_eq!(process_input(b"d", &mut m, &mut p), None);
-        assert_eq!(m.mode, Mode::ConfirmKill("a".into()));
-        assert_eq!(process_input(b"y", &mut m, &mut p), Some(LoopAction::Kill("a".into())));
-        assert_eq!(m.mode, Mode::Normal);
-    }
-
-    #[test]
-    fn process_input_kill_cancel() {
-        let mut m = Model::new(vec![mk("a")]);
-        let mut p = InputParser::new();
-        assert_eq!(process_input(b"d", &mut m, &mut p), None);
-        assert_eq!(process_input(b"x", &mut m, &mut p), None);
-        assert_eq!(m.mode, Mode::Normal);
-    }
-
-    #[test]
-    fn process_input_kill_empty_list() {
+    fn create_typing_accumulates_into_buffer() {
+        // Guards against a regression where keystrokes during
+        // CreateInput would reset the buffer or escape the modal
+        // early.
         let mut m = Model::new(vec![]);
-        let mut p = InputParser::new();
-        assert_eq!(process_input(b"d", &mut m, &mut p), None);
+        m.mode = Mode::CreateInput(String::new());
+        update(&mut m, key(Key::Char(b'f')));
+        update(&mut m, key(Key::Char(b'o')));
+        update(&mut m, key(Key::Char(b'o')));
+        assert_eq!(m.mode, Mode::CreateInput("foo".into()));
+    }
+
+    #[test]
+    fn create_esc_cancels() {
+        let mut m = Model::new(vec![mk("a")]);
+        m.mode = Mode::CreateInput("partial".into());
+        assert_eq!(update(&mut m, key(Key::Esc)), None);
         assert_eq!(m.mode, Mode::Normal);
     }
 
     #[test]
-    fn process_input_force_confirm() {
-        let mut m = Model::new(vec![mk("a")]);
-        m.mode = Mode::ConfirmForce("a".into());
-        let mut p = InputParser::new();
+    fn create_backspace_pops() {
+        let mut m = Model::new(vec![]);
+        m.mode = Mode::CreateInput("ab".into());
+        update(&mut m, key(Key::Backspace));
+        assert_eq!(m.mode, Mode::CreateInput("a".into()));
+    }
+
+    #[test]
+    fn create_rejects_empty_on_enter() {
+        // Empty name on Enter: return to Normal with no Command,
+        // rather than emitting Command::Create("") which shpool
+        // would reject.
+        let mut m = Model::new(vec![]);
+        m.mode = Mode::CreateInput(String::new());
+        assert_eq!(update(&mut m, key(Key::Enter)), None);
+        assert_eq!(m.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn create_drops_spaces_in_name() {
+        let mut m = Model::new(vec![]);
+        m.mode = Mode::CreateInput(String::new());
+        update(&mut m, key(Key::Char(b'a')));
+        update(&mut m, key(Key::Char(b' ')));
+        update(&mut m, key(Key::Char(b'b')));
+        assert_eq!(m.mode, Mode::CreateInput("ab".into()));
+    }
+
+    #[test]
+    fn confirm_kill_y_fires() {
+        let mut m = Model::new(vec![mk("a"), mk("b")]);
+        assert_eq!(update(&mut m, key(Key::Char(b'd'))), None);
+        assert_eq!(m.mode, Mode::ConfirmKill("a".into()));
         assert_eq!(
-            process_input(b"y", &mut m, &mut p),
-            Some(LoopAction::AttachForce("a".into())),
+            update(&mut m, key(Key::Char(b'y'))),
+            Some(Command::Kill("a".into()))
         );
         assert_eq!(m.mode, Mode::Normal);
     }
 
     #[test]
-    fn process_input_force_cancel() {
+    fn confirm_kill_any_non_y_cancels() {
         let mut m = Model::new(vec![mk("a")]);
-        m.mode = Mode::ConfirmForce("a".into());
-        let mut p = InputParser::new();
-        assert_eq!(process_input(b"n", &mut m, &mut p), None);
+        m.mode = Mode::ConfirmKill("a".into());
+        assert_eq!(update(&mut m, key(Key::Char(b'x'))), None);
         assert_eq!(m.mode, Mode::Normal);
     }
 
     #[test]
-    fn process_input_vim_navigate_and_attach() {
+    fn kill_on_empty_list_is_noop() {
+        let mut m = Model::new(vec![]);
+        assert_eq!(update(&mut m, key(Key::Char(b'd'))), None);
+        assert_eq!(m.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn confirm_force_y_force_attaches() {
+        let mut m = Model::new(vec![mk("a")]);
+        m.mode = Mode::ConfirmForce("a".into());
+        assert_eq!(
+            update(&mut m, key(Key::Char(b'y'))),
+            Some(Command::Attach { name: "a".into(), force: true }),
+        );
+        assert_eq!(m.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn confirm_force_n_cancels() {
+        let mut m = Model::new(vec![mk("a")]);
+        m.mode = Mode::ConfirmForce("a".into());
+        assert_eq!(update(&mut m, key(Key::Char(b'n'))), None);
+        assert_eq!(m.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn vim_jj_then_enter_attaches_third() {
         let mut m = Model::new(vec![mk("a"), mk("b"), mk("c")]);
-        let mut p = InputParser::new();
-        assert_eq!(process_input(b"jj\r", &mut m, &mut p), Some(LoopAction::Attach("c".into())));
+        update(&mut m, key(Key::Char(b'j')));
+        update(&mut m, key(Key::Char(b'j')));
+        assert_eq!(
+            update(&mut m, key(Key::Enter)),
+            Some(Command::Attach { name: "c".into(), force: false }),
+        );
     }
 }

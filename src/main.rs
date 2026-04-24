@@ -3,15 +3,15 @@ mod tty;
 mod tui;
 
 use std::io::{self, BufWriter, Write};
-use std::process::Command;
+use std::process;
 
 use anyhow::{Context, Result};
 
 use crate::session::{ListReply, Session};
-use crate::tui::{InputParser, LoopAction, Mode, Model};
+use crate::tui::{Command, Event, InputParser, Mode, Model};
 
 fn fetch_sessions() -> Result<Vec<Session>> {
-    let out = Command::new("shpool")
+    let out = process::Command::new("shpool")
         .args(["list", "--json"])
         .output()
         .context("running `shpool list --json`")?;
@@ -48,7 +48,7 @@ fn main() -> Result<()> {
              to manage sessions. Current list:\n"
         );
         use std::os::unix::process::CommandExt;
-        let err = Command::new("shpool").arg("list").exec();
+        let err = process::Command::new("shpool").arg("list").exec();
         anyhow::bail!("exec shpool list: {err}");
     }
     let mut model = Model::new(Vec::new());
@@ -62,7 +62,7 @@ fn run_tui(mut model: Model) -> Result<()> {
     let mut parser = InputParser::new();
 
     loop {
-        let action = {
+        let cmd = {
             let _raw = tty::RawMode::enter().context("entering raw mode")?;
             let stdout = io::stdout();
             let mut out = BufWriter::new(stdout.lock());
@@ -76,39 +76,36 @@ fn run_tui(mut model: Model) -> Result<()> {
             result?
         };
 
-        match action {
-            LoopAction::Attach(name) => {
+        match cmd {
+            Command::Attach { name, force } => {
                 // Pre-flight: refresh and verify the session is still
-                // present and not already attached. `shpool attach`
-                // reports "already has a terminal attached" on stderr
-                // with exit 0, and capturing stderr requires piping it
-                // — which breaks shpool's own detach detection (it
-                // checks isatty on stderr). So we check the attached
-                // flag here instead. If it raced into Attached since
-                // the keystroke, fall into the force-confirm prompt
-                // rather than silently no-opping.
+                // present and (for force=false) not already attached.
+                // `shpool attach` reports "already has a terminal
+                // attached" on stderr with exit 0, and capturing
+                // stderr requires piping it — which breaks shpool's
+                // own detach detection (it checks isatty on stderr).
+                // So we check the attached flag here instead. If it
+                // raced into Attached since the keystroke, fall into
+                // the force-confirm prompt rather than silently
+                // no-opping.
                 refresh_sessions(&mut model);
                 let Some(session) = model.sessions.iter().find(|s| s.name == name) else {
                     model.set_error(format!("session '{name}' is gone"));
                     continue;
                 };
-                if session.attached {
+                if !force && session.attached {
                     model.mode = Mode::ConfirmForce(name);
                     continue;
                 }
-                let ok = shell_attach(&name, false)?;
-                finish_action(&mut model, &name, ok, format!("shpool attach {name} failed"));
+                let ok = shell_attach(&name, force)?;
+                let err_msg = if force {
+                    format!("shpool attach -f {name} failed")
+                } else {
+                    format!("shpool attach {name} failed")
+                };
+                finish_action(&mut model, &name, ok, err_msg);
             }
-            LoopAction::AttachForce(name) => {
-                refresh_sessions(&mut model);
-                if !model.sessions.iter().any(|s| s.name == name) {
-                    model.set_error(format!("session '{name}' is gone"));
-                    continue;
-                }
-                let ok = shell_attach(&name, true)?;
-                finish_action(&mut model, &name, ok, format!("shpool attach -f {name} failed"));
-            }
-            LoopAction::Create(name) => {
+            Command::Create(name) => {
                 // Pre-flight: reject names that already exist. `shpool
                 // attach` is create-or-attach, so without this check a
                 // duplicate name silently attaches (or flashes "already
@@ -122,13 +119,13 @@ fn run_tui(mut model: Model) -> Result<()> {
                 let ok = shell_attach(&name, false)?;
                 finish_action(&mut model, &name, ok, format!("shpool attach {name} failed"));
             }
-            LoopAction::Kill(name) => {
+            Command::Kill(name) => {
                 refresh_sessions(&mut model);
                 if !model.sessions.iter().any(|s| s.name == name) {
                     model.set_error(format!("session '{name}' is gone"));
                     continue;
                 }
-                let output = Command::new("shpool")
+                let output = process::Command::new("shpool")
                     .args(["kill", &name])
                     .output()
                     .context("running `shpool kill`")?;
@@ -146,7 +143,7 @@ fn run_tui(mut model: Model) -> Result<()> {
                 };
                 finish_action(&mut model, &name, ok, err_msg);
             }
-            LoopAction::Quit => return Ok(()),
+            Command::Quit => return Ok(()),
         }
     }
 }
@@ -157,7 +154,7 @@ fn run_tui(mut model: Model) -> Result<()> {
 /// user's freshly-attached shell starts on a clean viewport.
 fn shell_attach(name: &str, force: bool) -> Result<bool> {
     tty::clear_screen(&mut io::stdout())?;
-    let mut cmd = Command::new("shpool");
+    let mut cmd = process::Command::new("shpool");
     cmd.arg("attach");
     if force {
         cmd.arg("-f");
@@ -184,7 +181,7 @@ fn event_loop<W: Write>(
     model: &mut Model,
     parser: &mut InputParser,
     out: &mut W,
-) -> Result<LoopAction> {
+) -> Result<Command> {
     let mut buf = [0u8; 16];
 
     loop {
@@ -193,15 +190,24 @@ fn event_loop<W: Write>(
         out.flush()?;
 
         match tty::read_stdin(&mut buf) {
-            Ok(0) => return Ok(LoopAction::Quit),
+            Ok(0) => return Ok(Command::Quit),
             Ok(n) => {
-                if let Some(action) = tui::process_input(&buf[..n], model, parser) {
-                    return Ok(action);
+                // One read can contain multiple keystrokes (e.g. "jj\r"
+                // arrives as a single buffer). Decode into a key stream
+                // and feed keys one-at-a-time into update — same shape
+                // as the crossterm-backed version, just without the
+                // per-key read.
+                let mut keys = Vec::new();
+                parser.feed(&buf[..n], &mut keys);
+                for key in keys {
+                    if let Some(cmd) = tui::update(model, Event::Key(key)) {
+                        return Ok(cmd);
+                    }
                 }
-                // Pick up sessions added or removed by other clients
-                // since the last keypress. Skipped in modal modes so
-                // typing into the create-name prompt isn't a per-keystroke
-                // `shpool list` storm.
+                // Auto-refresh lives here in main.rs for now — in a
+                // follow-up commit it moves into update() as
+                // Command::Refresh, so the daemon-call policy lives
+                // alongside the rest of the dispatch rules.
                 if matches!(model.mode, Mode::Normal) {
                     refresh_sessions(model);
                 }
