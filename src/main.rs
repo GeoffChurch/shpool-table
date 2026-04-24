@@ -72,6 +72,23 @@ fn now_unix_ms() -> u64 {
 fn fetch_sessions(flags: &Flags) -> Result<Vec<Session>> {
     let mut cmd = process::Command::new("shpool");
     flags.apply(&mut cmd);
+    list_sessions(cmd)
+}
+
+/// Same as `fetch_sessions`, but prepends `--daemonize` so shpool
+/// auto-forks a daemon first if one isn't running. Idempotent — no
+/// effect when the daemon is already up.
+fn ensure_daemon_and_list(flags: &Flags) -> Result<Vec<Session>> {
+    let mut cmd = process::Command::new("shpool");
+    flags.apply(&mut cmd);
+    cmd.arg("--daemonize");
+    list_sessions(cmd)
+}
+
+/// Run `<cmd> list --json` and parse the reply. Caller is responsible
+/// for constructing `cmd` with the shpool binary + any global flags
+/// already applied.
+fn list_sessions(mut cmd: process::Command) -> Result<Vec<Session>> {
     let out = cmd
         .args(["list", "--json"])
         .output()
@@ -241,6 +258,17 @@ fn execute<W: Write>(
         }
         Command::Refresh => {
             let ev = match fetch_sessions(flags) {
+                Ok(sessions) => Event::SessionsRefreshed(sessions),
+                Err(e) => Event::RefreshFailed(format!("{e}")),
+            };
+            Ok(Some(ev))
+        }
+        Command::EnsureDaemon => {
+            // `--daemonize` makes shpool fork a daemon if one isn't
+            // running, then run the list. Idempotent: if the daemon
+            // is already up, the flag is a no-op. Result is the same
+            // shape as a plain Refresh.
+            let ev = match ensure_daemon_and_list(flags) {
                 Ok(sessions) => Event::SessionsRefreshed(sessions),
                 Err(e) => Event::RefreshFailed(format!("{e}")),
             };

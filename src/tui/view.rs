@@ -402,8 +402,11 @@ mod tests {
 
     #[test]
     fn empty_list_shows_hint() {
+        // Width 72 fits the full Normal-mode footer including all
+        // keybindings. Narrower terminals clip the footer's tail but
+        // the rest of the TUI still functions.
         let m = Model::new(vec![]);
-        insta::assert_snapshot!(render_visible(&m, 60, 6));
+        insta::assert_snapshot!(render_visible(&m, 72, 6));
     }
 
     #[test]

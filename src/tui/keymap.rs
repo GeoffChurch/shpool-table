@@ -50,6 +50,7 @@ pub enum NormalAction {
     AttachSelected,
     NewSession,
     KillSelected,
+    EnsureDaemon,
     Quit,
 }
 
@@ -91,8 +92,14 @@ pub const NORMAL_BINDINGS: &[Binding] = &[
     Binding {
         label: "d",
         description: "kill",
-        keys: &[Key::Char(b'd'), Key::Char(b'D')],
+        keys: &[Key::Char(b'd')],
         action: NormalAction::KillSelected,
+    },
+    Binding {
+        label: "D",
+        description: "daemon",
+        keys: &[Key::Char(b'D')],
+        action: NormalAction::EnsureDaemon,
     },
     Binding {
         label: "q",
@@ -134,6 +141,7 @@ mod tests {
         assert_eq!(normal_action(Key::Ctrl(0x03)), Some(NormalAction::Quit));
         assert_eq!(normal_action(Key::Char(b'n')), Some(NormalAction::NewSession));
         assert_eq!(normal_action(Key::Char(b'd')), Some(NormalAction::KillSelected));
+        assert_eq!(normal_action(Key::Char(b'D')), Some(NormalAction::EnsureDaemon));
         assert_eq!(normal_action(Key::Char(b'j')), Some(NormalAction::SelectNext));
         assert_eq!(normal_action(Key::Char(b'k')), Some(NormalAction::SelectPrev));
         assert_eq!(normal_action(Key::Esc), None);

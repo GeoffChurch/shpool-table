@@ -10,6 +10,12 @@ pub enum Command {
     /// Event::SessionsRefreshed or Event::RefreshFailed.
     Refresh,
 
+    /// Ensure a shpool daemon is running, then refetch the session
+    /// list. Equivalent to `shpool --daemonize list --json`: idempotent
+    /// (no-op if the daemon is already up). Result comes back as
+    /// Event::SessionsRefreshed or Event::RefreshFailed.
+    EnsureDaemon,
+
     /// Spawn `shpool attach [-f] <name>` as a child process. `force`
     /// passes `-f` through — reached either from a plain attach or
     /// from the ConfirmForce prompt.

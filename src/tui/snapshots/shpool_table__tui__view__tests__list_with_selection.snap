@@ -1,10 +1,9 @@
 ---
 source: src/tui/view.rs
-assertion_line: 416
 expression: "render_visible(&m, 70, 6)"
 ---
                          shpool (2 sessions)                          
   name   created  active                                              
 * main   2m       2m                                                  
  >build  3h       3h                                                  
-  j down   k up   spc attach   n new   d kill   q quit
+  j down   k up   spc attach   n new   d kill   D daemon   q quit

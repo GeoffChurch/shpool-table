@@ -108,6 +108,7 @@ fn handle_key_normal(model: &mut Model, key: Key) -> Option<Command> {
             model.mode = Mode::ConfirmKill(name);
             None
         }
+        NormalAction::EnsureDaemon => Some(Command::EnsureDaemon),
         NormalAction::Quit => Some(Command::Quit),
     }
 }
@@ -506,6 +507,24 @@ mod tests {
     fn focus_gained_triggers_refresh() {
         let mut m = Model::new(vec![]);
         assert_eq!(update(&mut m, Event::FocusGained), Some(Command::Refresh));
+    }
+
+    #[test]
+    fn uppercase_d_fires_ensure_daemon() {
+        let mut m = Model::new(vec![mk("a")]);
+        assert_eq!(
+            update(&mut m, key(Key::Char(b'D'))),
+            Some(Command::EnsureDaemon),
+        );
+    }
+
+    #[test]
+    fn lowercase_d_still_enters_confirm_kill() {
+        // Guard against a regression where the case-split between
+        // d (kill) and D (daemon) gets re-fused.
+        let mut m = Model::new(vec![mk("a")]);
+        update(&mut m, key(Key::Char(b'd')));
+        assert_eq!(m.mode, Mode::ConfirmKill("a".into()));
     }
 
     #[test]
