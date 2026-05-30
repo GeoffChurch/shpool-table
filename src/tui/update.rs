@@ -136,18 +136,29 @@ fn handle_key(model: &mut Model, key: Key) -> Option<Command> {
 fn handle_key_normal(model: &mut Model, key: Key) -> Option<Command> {
     let action = normal_action(key);
 
-    // Acknowledge a stale selection on the first keystroke — whatever
-    // it is. Clear the flag and its error; for the act-on-selection
-    // keys, also swallow the keystroke so the action can't strike
-    // whatever shifted into the vanished session's row. Navigation (and
-    // everything else) falls through and re-seats naturally.
+    // Acknowledge a stale selection on the first keystroke — whatever it
+    // is. Clear the error; for the act-on-selection keys, also swallow
+    // the keystroke so the action can't strike whatever shifted into the
+    // vanished session's row.
     if model.is_stale() {
-        model.selection = Selection::None;
         model.error = None;
-        if matches!(
+        let swallow = matches!(
             action,
             Some(NormalAction::AttachSelected | NormalAction::KillSelected)
-        ) {
+        );
+        // Re-seat the cursor onto the freshest row for keys that would
+        // otherwise strand it on nothing: a swallowed act-on-selection
+        // key, or any unbound key. Navigation re-seats itself
+        // (None -> first/last) and the mode-changing keys resolve their
+        // own state, so those just fall through with the selection
+        // cleared. This keeps the subscribed path consistent with the
+        // fallback one, where the post-ack auto-refresh re-seats anyway.
+        model.selection = if (swallow || action.is_none()) && !model.sessions.is_empty() {
+            Selection::At(0)
+        } else {
+            Selection::None
+        };
+        if swallow {
             return Option::None;
         }
     }
@@ -733,6 +744,27 @@ mod tests {
         update(&mut m, key(Key::Char(b'j')));
         assert!(!m.is_stale());
         assert!(m.selected_name().is_some());
+    }
+
+    #[test]
+    fn stale_ack_reseats_onto_a_row_even_when_subscribed() {
+        // Subscribed: there's no fallback auto-refresh to re-seat the
+        // cursor, so acking must land it on a real row itself rather than
+        // strand it on None. Covers an unbound key and a swallowed
+        // act-on-selection key — the two paths that don't navigate.
+        for ack in [Key::Char(b'x'), Key::Enter] {
+            let mut m = Model::new(vec![mk("a"), mk("b"), mk("c")]);
+            m.events_active = true;
+            m.selection = Selection::At(1); // "b"
+            update(&mut m, Event::SessionsRefreshed(vec![mk("a"), mk("c")]));
+            assert!(m.is_stale());
+            update(&mut m, key(ack));
+            assert!(!m.is_stale(), "ack with {ack:?} should clear stale");
+            assert!(
+                m.selected_index().is_some(),
+                "ack with {ack:?} should re-seat onto a row, not strand at None",
+            );
+        }
     }
 
     // -- modal cancelled when its target vanishes --

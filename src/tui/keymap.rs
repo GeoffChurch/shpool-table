@@ -37,8 +37,9 @@ pub enum Key {
 // The set of logical actions bound to keys in Normal mode. We use an
 // enum rather than a direct `fn(&mut Model)` in the binding table
 // because actions differ in what state they touch: SelectNext is
-// stateless but AttachSelected needs model.sessions[model.selected],
-// and keeping the dispatch as "lookup action, then match in update.rs"
+// stateless but AttachSelected needs the selected session's name (via
+// model.selected_name()), and keeping the dispatch as "lookup action,
+// then match in update.rs"
 // lets each action pull exactly what it needs. The compiler's
 // exhaustiveness check then catches drift if a new action is added
 // without a handler.
