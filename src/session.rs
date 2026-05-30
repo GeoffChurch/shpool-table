@@ -22,10 +22,12 @@ pub struct Session {
 }
 
 impl Session {
-    /// Unix ms of the most recent state transition — the newer of
-    /// last-connected and last-disconnected, falling back to
-    /// creation time. Used for "last-active" sorting.
-    pub fn last_active_unix_ms(&self) -> u64 {
+    /// Unix ms of the most recent time this session was touched — the
+    /// newest of last-connected, last-disconnected, and creation time.
+    /// Drives the most-recent-first sort. Named "touched" rather than
+    /// "active" because a brand-new session (only `started_at` set)
+    /// reads as freshly touched at creation, not as currently active.
+    pub fn last_touched_unix_ms(&self) -> u64 {
         self.last_connected_at_unix_ms
             .max(self.last_disconnected_at_unix_ms.unwrap_or(0))
             .max(self.started_at_unix_ms)
@@ -65,10 +67,10 @@ mod tests {
         assert_eq!(reply.sessions.len(), 2);
         assert_eq!(reply.sessions[0].name, "main");
         assert!(reply.sessions[0].attached);
-        assert_eq!(reply.sessions[0].last_active_unix_ms(), 2000);
+        assert_eq!(reply.sessions[0].last_touched_unix_ms(), 2000);
         assert_eq!(reply.sessions[1].name, "build");
         assert!(!reply.sessions[1].attached);
-        assert_eq!(reply.sessions[1].last_active_unix_ms(), 1500);
+        assert_eq!(reply.sessions[1].last_touched_unix_ms(), 1500);
     }
 
     #[test]

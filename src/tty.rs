@@ -1,5 +1,6 @@
 use std::io::{self, Write};
 use std::mem::MaybeUninit;
+use std::os::fd::RawFd;
 use std::sync::Once;
 
 use anyhow::{Context, Result};
@@ -94,6 +95,40 @@ pub fn install_sigwinch_handler() -> Result<()> {
 }
 
 extern "C" fn sigwinch_noop(_sig: libc::c_int) {}
+
+/// Which descriptors `poll_readable` found ready.
+pub struct Ready {
+    pub stdin: bool,
+    pub events: bool,
+}
+
+/// Block until stdin and/or `events_fd` (when subscribed) is readable,
+/// reporting which. A signal (SIGWINCH) interrupts the wait and surfaces
+/// as `ErrorKind::Interrupted`, so the caller re-renders — the same
+/// contract `read_stdin` has. Infinite timeout: we wake only on input,
+/// a push event, or a signal, so an idle table costs nothing.
+pub fn poll_readable(events_fd: Option<RawFd>) -> io::Result<Ready> {
+    // A negative fd is ignored by poll(2), so the events slot is inert
+    // while there's no subscription.
+    let mut fds = [
+        libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 },
+        libc::pollfd { fd: events_fd.unwrap_or(-1), events: libc::POLLIN, revents: 0 },
+    ];
+    let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // POLLHUP / POLLERR / POLLNVAL also mean "go look at it" — for the
+    // events pipe a HUP is exactly the EOF the caller wants to see via
+    // drain(), which then tears the subscription down.
+    let readable = |pfd: &libc::pollfd| {
+        pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+    };
+    Ok(Ready {
+        stdin: readable(&fds[0]),
+        events: events_fd.is_some() && readable(&fds[1]),
+    })
+}
 
 /// Read from stdin via libc::read so EINTR from signal handlers is
 /// visible to the caller (Rust's std Read silently retries on EINTR).

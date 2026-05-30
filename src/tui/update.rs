@@ -11,39 +11,55 @@
 use super::command::Command;
 use super::event::Event;
 use super::keymap::{normal_action, Key, NormalAction};
-use super::model::{Mode, Model};
+use super::model::{Mode, Model, Selection};
 
 /// Fold one event into the model. Returns `Some(Command)` if the
 /// event triggers a side effect (attach / kill / create / quit /
 /// refresh).
 pub fn update(model: &mut Model, event: Event) -> Option<Command> {
-    // Any keystroke clears the transient error — the user has seen
-    // it now. Async events SET errors but don't clear them, so that
-    // messages about failed background actions don't self-dismiss.
+    // Any keystroke clears the transient error — the user has seen it
+    // now. Async events SET errors but don't clear them, so messages
+    // about failed background actions don't self-dismiss.
+    //
+    // Exception: while the selection is stale, the error rides through
+    // this first keystroke. handle_key_normal consumes that keystroke
+    // as the acknowledgment and clears both together — so the "is gone"
+    // message is guaranteed at least one frame in front of the user.
     let was_keystroke = matches!(event, Event::Key(_));
-    if was_keystroke {
+    if was_keystroke && !model.is_stale() {
         model.error = None;
     }
 
     let cmd = match event {
         Event::Key(k) => handle_key(model, k),
-        Event::FocusGained => Some(Command::Refresh),
+        // Focus-gained is pure redundancy while subscribed — the event
+        // stream already keeps the list current.
+        Event::FocusGained => refresh_unless_subscribed(model),
+        // An event from the subscription always means "re-list".
+        Event::EventsArrived => Some(Command::Refresh),
         Event::SessionsRefreshed(sessions) => {
             model.refresh(sessions);
-            None
+            cancel_modal_if_target_gone(model);
+            Option::None
         }
         Event::RefreshFailed(msg) => {
             model.set_error(format!("shpool list: {msg}"));
-            None
+            Option::None
         }
         Event::AttachExited { ok, name } => {
+            // A completed action supersedes any stale-selection state
+            // left over from before it (e.g. a session vanished while
+            // the user sat inside the attach). Clear it ahead of the
+            // refresh below, which re-raises stale only if something
+            // fresh disappeared mid-action.
+            clear_pre_action_alert(model);
             if !ok {
                 model.set_error(format!("shpool attach {name} failed"));
             }
             // Reselect the session we just attached to, so when the
             // user returns they're looking at what they just left.
             if let Some(i) = model.sessions.iter().position(|s| s.name == name) {
-                model.selected = i;
+                model.selection = Selection::At(i);
             }
             // Always refresh after attach: state may have changed
             // while we were suspended (other clients detached,
@@ -51,6 +67,7 @@ pub fn update(model: &mut Model, event: Event) -> Option<Command> {
             Some(Command::Refresh)
         }
         Event::KillFinished { ok, name, err } => {
+            clear_pre_action_alert(model);
             if !ok {
                 let msg = err.unwrap_or_else(|| format!("kill {name} failed"));
                 model.set_error(msg);
@@ -59,29 +76,86 @@ pub fn update(model: &mut Model, event: Event) -> Option<Command> {
         }
     };
 
-    // Auto-refresh: a Normal-mode keystroke that produced no Command
-    // of its own requests a refresh so the list tracks daemon-side
-    // changes (sessions created/killed/detached by other clients)
-    // without needing explicit user action. Skipped in modal modes
-    // so typing "foo" into CreateInput isn't three shell-outs.
-    if was_keystroke && cmd.is_none() && matches!(model.mode, Mode::Normal) {
+    // Auto-refresh: a Normal-mode keystroke that produced no Command of
+    // its own requests a refresh so the list tracks daemon-side changes
+    // (sessions created/killed/detached by other clients) without
+    // explicit user action. Skipped in modal modes so typing "foo" into
+    // CreateInput isn't three shell-outs, and skipped while subscribed —
+    // the event stream already keeps us current, so this fallback would
+    // only double the list calls.
+    if was_keystroke
+        && cmd.is_none()
+        && matches!(model.mode, Mode::Normal)
+        && !model.events_active
+    {
         return Some(Command::Refresh);
     }
     cmd
+}
+
+/// Refresh unless an events subscription is already keeping the list
+/// current. The focus-gained path is pure redundancy while subscribed.
+fn refresh_unless_subscribed(model: &Model) -> Option<Command> {
+    if model.events_active {
+        Option::None
+    } else {
+        Some(Command::Refresh)
+    }
+}
+
+/// Clear the transient error and demote a stale selection back to a
+/// clean slate, ahead of a completed action's own refresh. A valid
+/// `At` selection is left untouched; only the stale/cleared alert goes.
+fn clear_pre_action_alert(model: &mut Model) {
+    if model.is_stale() {
+        model.selection = Selection::None;
+    }
+    model.error = None;
+}
+
+/// Drop a kill / force-attach modal whose target session has vanished
+/// from under it — any refresh (event-driven, focus, the keystroke
+/// fallback) can race ahead of the user mid-prompt. CreateInput is
+/// safe: its buffer is a name being typed, not a session reference.
+fn cancel_modal_if_target_gone(model: &mut Model) {
+    let target = match &model.mode {
+        Mode::ConfirmKill(name) | Mode::ConfirmForce(name) => name.clone(),
+        _ => return,
+    };
+    if !model.sessions.iter().any(|s| s.name == target) {
+        model.mode = Mode::Normal;
+        model.set_error(format!("session '{target}' is gone"));
+    }
 }
 
 fn handle_key(model: &mut Model, key: Key) -> Option<Command> {
     match &model.mode {
         Mode::Normal => handle_key_normal(model, key),
         Mode::CreateInput(_) => handle_key_create(model, key),
-        Mode::ConfirmKill(_) => handle_key_confirm_kill(model, key),
-        Mode::ConfirmForce(_) => handle_key_confirm_force(model, key),
+        Mode::ConfirmKill(_) | Mode::ConfirmForce(_) => handle_key_confirm(model, key),
     }
 }
 
 fn handle_key_normal(model: &mut Model, key: Key) -> Option<Command> {
-    let action = normal_action(key)?;
-    match action {
+    let action = normal_action(key);
+
+    // Acknowledge a stale selection on the first keystroke — whatever
+    // it is. Clear the flag and its error; for the act-on-selection
+    // keys, also swallow the keystroke so the action can't strike
+    // whatever shifted into the vanished session's row. Navigation (and
+    // everything else) falls through and re-seats naturally.
+    if model.is_stale() {
+        model.selection = Selection::None;
+        model.error = None;
+        if matches!(
+            action,
+            Some(NormalAction::AttachSelected | NormalAction::KillSelected)
+        ) {
+            return Option::None;
+        }
+    }
+
+    match action? {
         NormalAction::SelectPrev => {
             model.select_prev();
             None
@@ -159,41 +233,35 @@ fn handle_key_create(model: &mut Model, key: Key) -> Option<Command> {
     }
 }
 
-fn handle_key_confirm_kill(model: &mut Model, key: Key) -> Option<Command> {
-    let Mode::ConfirmKill(name) = &mut model.mode else {
-        return None;
-    };
+/// Handle a key in either confirm modal (kill or force-attach). y/Y
+/// confirms; n/N/Esc/Ctrl-C cancels; every other key — arrows, stray
+/// letters, a fat-fingered space — is ignored so the prompt stays put.
+/// The old "any non-y key cancels" made it far too easy to dismiss a
+/// prompt by accident, which matters more now that background refreshes
+/// keep the modal up while state churns underneath it. The two modes
+/// differ only in the action confirmed, so they share this handler.
+fn handle_key_confirm(model: &mut Model, key: Key) -> Option<Command> {
     match key {
         Key::Char(b'y') | Key::Char(b'Y') => {
-            let name = std::mem::take(name);
-            model.mode = Mode::Normal;
-            Some(Command::Kill(name))
+            match std::mem::replace(&mut model.mode, Mode::Normal) {
+                Mode::ConfirmKill(name) => {
+                    // Step the cursor onto a neighbor first so the
+                    // post-kill refresh reads the user's own kill as an
+                    // expected change, not a stale disappearance.
+                    model.advance_off(&name);
+                    Some(Command::Kill(name))
+                }
+                Mode::ConfirmForce(name) => Some(Command::Attach { name, force: true }),
+                // handle_key only routes the two confirm modes here.
+                _ => Option::None,
+            }
         }
-        _ => {
-            // Any non-y keystroke cancels. Intentional — matches
-            // existing shpool-table behavior before the refactor;
-            // stricter "only n/Enter/Esc cancel" would be a UX
-            // change, not an architectural one.
+        Key::Char(b'n') | Key::Char(b'N') | Key::Esc | Key::Ctrl(0x03) => {
             model.mode = Mode::Normal;
-            None
+            Option::None
         }
-    }
-}
-
-fn handle_key_confirm_force(model: &mut Model, key: Key) -> Option<Command> {
-    let Mode::ConfirmForce(name) = &mut model.mode else {
-        return None;
-    };
-    match key {
-        Key::Char(b'y') | Key::Char(b'Y') => {
-            let name = std::mem::take(name);
-            model.mode = Mode::Normal;
-            Some(Command::Attach { name, force: true })
-        }
-        _ => {
-            model.mode = Mode::Normal;
-            None
-        }
+        // Any other key: stay in the modal rather than dismissing it.
+        _ => Option::None,
     }
 }
 
@@ -372,12 +440,37 @@ mod tests {
     }
 
     #[test]
-    fn confirm_kill_any_non_y_cancels() {
-        // Non-y cancels back to Normal, which then auto-refreshes.
+    fn confirm_kill_stray_key_is_ignored() {
+        // Strict modals: a stray key (arrow, space, random letter) no
+        // longer dismisses the prompt — it stays put with no command.
         let mut m = Model::new(vec![mk("a")]);
         m.mode = Mode::ConfirmKill("a".into());
-        assert_eq!(update(&mut m, key(Key::Char(b'x'))), Some(Command::Refresh));
-        assert_eq!(m.mode, Mode::Normal);
+        assert_eq!(update(&mut m, key(Key::Char(b'x'))), None);
+        assert_eq!(m.mode, Mode::ConfirmKill("a".into()));
+        assert_eq!(update(&mut m, key(Key::Down)), None);
+        assert_eq!(m.mode, Mode::ConfirmKill("a".into()));
+    }
+
+    #[test]
+    fn confirm_kill_n_and_esc_cancel() {
+        for cancel in [Key::Char(b'n'), Key::Char(b'N'), Key::Esc, Key::Ctrl(0x03)] {
+            let mut m = Model::new(vec![mk("a")]);
+            m.mode = Mode::ConfirmKill("a".into());
+            // Cancel returns to Normal, which then auto-refreshes.
+            assert_eq!(update(&mut m, key(cancel)), Some(Command::Refresh));
+            assert_eq!(m.mode, Mode::Normal);
+        }
+    }
+
+    #[test]
+    fn confirm_kill_y_advances_cursor_off_target() {
+        // 'y' steps the cursor onto a neighbor before issuing the kill,
+        // so the post-kill refresh won't read it as a stale loss.
+        let mut m = Model::new(vec![mk("a"), mk("b")]);
+        m.selection = Selection::At(0); // "a"
+        m.mode = Mode::ConfirmKill("a".into());
+        assert_eq!(update(&mut m, key(Key::Char(b'y'))), Some(Command::Kill("a".into())));
+        assert_eq!(m.selected_name(), Some("b"));
     }
 
     #[test]
@@ -436,13 +529,13 @@ mod tests {
     #[test]
     fn attach_exited_ok_reselects_and_refreshes() {
         let mut m = Model::new(vec![mk("a"), mk("b"), mk("c")]);
-        m.selected = 0;
+        m.selection = Selection::At(0);
         let cmd = update(
             &mut m,
             Event::AttachExited { ok: true, name: "c".into() },
         );
         assert_eq!(cmd, Some(Command::Refresh));
-        assert_eq!(m.selected, 2);
+        assert_eq!(m.selected_index(), Some(2));
         assert!(m.error.is_none());
     }
 
@@ -544,5 +637,124 @@ mod tests {
             update(&mut m, key(Key::Enter)),
             Some(Command::Attach { name: "c".into(), force: false }),
         );
+    }
+
+    // -- events subscription gating --
+
+    #[test]
+    fn events_arrived_refreshes() {
+        let mut m = Model::new(vec![]);
+        assert_eq!(update(&mut m, Event::EventsArrived), Some(Command::Refresh));
+    }
+
+    #[test]
+    fn subscribed_keystroke_skips_auto_refresh() {
+        // While subscribed the event stream keeps the list current, so a
+        // no-op Normal keystroke must NOT also fire a list call.
+        let mut m = Model::new(vec![mk("a")]);
+        m.events_active = true;
+        assert_eq!(update(&mut m, key(Key::Char(b'x'))), None);
+    }
+
+    #[test]
+    fn subscribed_focus_gained_skips_refresh() {
+        let mut m = Model::new(vec![]);
+        m.events_active = true;
+        assert_eq!(update(&mut m, Event::FocusGained), None);
+    }
+
+    #[test]
+    fn unsubscribed_focus_gained_refreshes() {
+        let mut m = Model::new(vec![]);
+        assert_eq!(update(&mut m, Event::FocusGained), Some(Command::Refresh));
+    }
+
+    // -- stale-selection acknowledgment --
+
+    #[test]
+    fn stale_selection_consumes_enter_without_attaching() {
+        let mut m = Model::new(vec![mk("a"), mk("b"), mk("c")]);
+        m.selection = Selection::At(1); // "b"
+        // A racy refresh drops "b": selection goes stale, error set.
+        update(&mut m, Event::SessionsRefreshed(vec![mk("a"), mk("c")]));
+        assert!(m.is_stale());
+        assert!(m.error.is_some());
+        // First Enter is the acknowledgment: no Attach, error cleared,
+        // selection no longer stale.
+        let cmd = update(&mut m, key(Key::Enter));
+        assert!(!matches!(cmd, Some(Command::Attach { .. })));
+        assert!(!m.is_stale());
+        assert!(m.error.is_none());
+    }
+
+    #[test]
+    fn stale_selection_consumes_kill_keystroke() {
+        let mut m = Model::new(vec![mk("a"), mk("b")]);
+        m.selection = Selection::At(1);
+        update(&mut m, Event::SessionsRefreshed(vec![mk("a")]));
+        assert!(m.is_stale());
+        // d is consumed as ack — no ConfirmKill, no command that could
+        // act on the wrong row.
+        let cmd = update(&mut m, key(Key::Char(b'd')));
+        assert!(!matches!(cmd, Some(Command::Kill(_))));
+        assert_eq!(m.mode, Mode::Normal);
+        assert!(!m.is_stale());
+    }
+
+    #[test]
+    fn stale_selection_navigation_clears_and_moves() {
+        let mut m = Model::new(vec![mk("a"), mk("b"), mk("c")]);
+        m.selection = Selection::At(1);
+        update(&mut m, Event::SessionsRefreshed(vec![mk("a"), mk("c")]));
+        assert!(m.is_stale());
+        // j acknowledges AND re-seats onto a real row.
+        update(&mut m, key(Key::Char(b'j')));
+        assert!(!m.is_stale());
+        assert!(m.selected_name().is_some());
+    }
+
+    // -- modal cancelled when its target vanishes --
+
+    #[test]
+    fn confirm_kill_cancelled_when_target_vanishes() {
+        let mut m = Model::new(vec![mk("a"), mk("b")]);
+        m.selection = Selection::At(0);
+        m.mode = Mode::ConfirmKill("a".into());
+        // A background refresh removes "a" out from under the prompt.
+        update(&mut m, Event::SessionsRefreshed(vec![mk("b")]));
+        assert_eq!(m.mode, Mode::Normal);
+        assert!(m.error.as_deref().unwrap_or("").contains("'a' is gone"));
+    }
+
+    #[test]
+    fn confirm_force_cancelled_when_target_vanishes() {
+        let mut m = Model::new(vec![mk("a"), mk("b")]);
+        m.mode = Mode::ConfirmForce("a".into());
+        update(&mut m, Event::SessionsRefreshed(vec![mk("b")]));
+        assert_eq!(m.mode, Mode::Normal);
+        assert!(m.error.as_deref().unwrap_or("").contains("'a' is gone"));
+    }
+
+    #[test]
+    fn create_modal_survives_session_churn() {
+        // CreateInput holds a name being typed, not a session ref, so a
+        // refresh that changes the list must not cancel it.
+        let mut m = Model::new(vec![mk("a")]);
+        m.mode = Mode::CreateInput("foo".into());
+        update(&mut m, Event::SessionsRefreshed(vec![mk("b")]));
+        assert_eq!(m.mode, Mode::CreateInput("foo".into()));
+    }
+
+    #[test]
+    fn attach_return_clears_prior_stale() {
+        // The user was stale (a session vanished), then completed an
+        // attach. Returning clears the now-irrelevant stale alert.
+        let mut m = Model::new(vec![mk("a")]);
+        m.selection = Selection::Stale("old".into());
+        m.set_error("session 'old' is gone");
+        let cmd = update(&mut m, Event::AttachExited { ok: true, name: "a".into() });
+        assert_eq!(cmd, Some(Command::Refresh));
+        assert!(!m.is_stale());
+        assert!(m.error.is_none());
     }
 }

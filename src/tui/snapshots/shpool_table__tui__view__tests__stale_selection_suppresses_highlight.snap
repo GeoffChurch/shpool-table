@@ -1,0 +1,9 @@
+---
+source: src/tui/view.rs
+expression: "render_visible(&m, 70, 6)"
+---
+                         shpool (2 sessions)                          
+  name   created  active                                              
+  main   1m       1m                                                  
+  build  5m       5m                                                  
+  ! session 'gone' is gone

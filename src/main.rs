@@ -1,3 +1,4 @@
+mod events;
 mod session;
 mod tty;
 mod tui;
@@ -8,13 +9,16 @@ use std::process;
 use anyhow::{Context, Result};
 use clap::Parser;
 
+use crate::events::{Drain, EventsSub};
 use crate::session::{ListReply, Session};
 use crate::tui::{Command, Event, Input, InputParser, Model};
 
-/// Top-level flags, forwarded verbatim to every `shpool` shell-out
-/// (list, kill, attach). Mirrors shpool's own top-level flags so that
-/// `shpool-table --config-file foo.toml` behaves like
-/// `shpool --config-file foo.toml list` etc.
+/// Top-level flags. `apply` re-emits the four below — in a fixed order,
+/// ahead of the subcommand — onto every `shpool` shell-out (list, kill,
+/// attach, events); it forwards exactly these, so a new shpool top-level
+/// flag we want to pass through has to be added here too. Mirrors
+/// shpool's own top-level flags, so `shpool-table --config-file foo.toml`
+/// behaves like `shpool --config-file foo.toml list` etc.
 ///
 /// `--daemonize` / `--no-daemonize` are deliberately not included —
 /// auto-launching a daemon from under the TUI (especially mid-session)
@@ -154,6 +158,14 @@ fn run_tui(flags: &Flags) -> Result<()> {
 /// Keeps the TUI in alt-screen + raw mode the whole time, except when
 /// `execute` spawns a child `shpool attach` — that path toggles both
 /// off, runs the child, and toggles them back on.
+///
+/// Multiplexes stdin with a `shpool events` subscription (when one can
+/// be had) so changes from other clients refresh the table without a
+/// keystroke. When the subscription is unavailable or drops, the loop
+/// falls back to refreshing on keystrokes + focus events, and climbs
+/// back to push mode the next time the user does something — see the
+/// reconnect note below. The fallback is visible, not silent: an EOF
+/// surfaces a footer notice so the user knows push updates have paused.
 fn main_loop<W: Write>(
     model: &mut Model,
     parser: &mut InputParser,
@@ -162,6 +174,13 @@ fn main_loop<W: Write>(
     alt: &tty::AltScreen,
     flags: &Flags,
 ) -> Result<()> {
+    // Subscribe before the initial list so a change landing during the
+    // list call still wakes us. The subscribe is also the capability
+    // probe: if it can't run, `events` stays None and we open in
+    // keystroke-refresh fallback.
+    let mut events = EventsSub::spawn(flags);
+    model.events_active = events.is_some();
+
     // Initial fetch: if the daemon is up, show its list immediately;
     // if not, the RefreshFailed event surfaces the error in the footer
     // and the user can retry (or quit).
@@ -169,7 +188,7 @@ fn main_loop<W: Write>(
         Ok(s) => Event::SessionsRefreshed(s),
         Err(e) => Event::RefreshFailed(format!("{e}")),
     };
-    run_cascade(model, initial, out, raw, alt, flags)?;
+    run_cascade(model, initial, out, raw, alt, flags, &mut events)?;
 
     let mut buf = [0u8; 16];
     loop {
@@ -186,35 +205,79 @@ fn main_loop<W: Write>(
             return Ok(());
         }
 
-        match tty::read_stdin(&mut buf) {
-            Ok(0) => {
-                // EOF on stdin — treat as quit so we exit cleanly.
-                model.quit = true;
-            }
-            Ok(n) => {
-                // A single read can decode to multiple inputs (pastes,
-                // CSI sequences, jj\r typed fast, a focus-report
-                // arriving next to a keystroke). Feed each through
-                // its own cascade so auto-refresh / attach / etc.
-                // fire per input.
-                let mut inputs = Vec::new();
-                parser.feed(&buf[..n], &mut inputs);
-                for input in inputs {
-                    let event = match input {
-                        Input::Key(k) => Event::Key(k),
-                        Input::FocusGained => Event::FocusGained,
-                    };
-                    run_cascade(model, event, out, raw, alt, flags)?;
-                    if model.quit {
-                        break;
+        let ready = match tty::poll_readable(events.as_ref().map(EventsSub::fd)) {
+            Ok(r) => r,
+            // SIGWINCH — loop back to re-query tty_size and redraw.
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e).context("polling stdin + events"),
+        };
+
+        // Drain the event stream first, so a refresh it triggers is in
+        // place before we react to a keystroke from the same wake — the
+        // attached flag an Enter would pre-flight against, say.
+        if ready.events {
+            match events.as_mut().map(EventsSub::drain) {
+                Some(Drain::Activity) => {
+                    run_cascade(model, Event::EventsArrived, out, raw, alt, flags, &mut events)?;
+                }
+                Some(Drain::Eof) => {
+                    // Subscription ended: daemon down, slow-subscriber
+                    // drop, or a daemon with no events socket. Tear it
+                    // down, catch the list up once, and surface it — we
+                    // don't auto-reconnect until the user acts, so they
+                    // should know push has paused. A specific list error
+                    // (daemon truly down) outranks the generic notice.
+                    teardown_events(&mut events, model);
+                    run_cascade(model, Event::EventsArrived, out, raw, alt, flags, &mut events)?;
+                    if model.error.is_none() {
+                        model.set_error(
+                            "events unavailable — refreshing on keypress (D to reconnect)",
+                        );
                     }
                 }
+                None => {}
             }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {
-                // SIGWINCH — loop back to re-query tty_size and redraw.
-                continue;
+        }
+
+        if ready.stdin {
+            match tty::read_stdin(&mut buf) {
+                Ok(0) => model.quit = true, // EOF on stdin — exit cleanly.
+                Ok(n) => {
+                    // A single read can decode to multiple inputs
+                    // (pastes, CSI sequences, jj\r typed fast, a
+                    // focus-report next to a keystroke). Feed each
+                    // through its own cascade so auto-refresh / attach /
+                    // etc. fire per input.
+                    let mut inputs = Vec::new();
+                    parser.feed(&buf[..n], &mut inputs);
+                    for input in inputs {
+                        let event = match input {
+                            Input::Key(k) => Event::Key(k),
+                            Input::FocusGained => Event::FocusGained,
+                        };
+                        run_cascade(model, event, out, raw, alt, flags, &mut events)?;
+                        if model.quit {
+                            break;
+                        }
+                    }
+                }
+                // SIGWINCH landed between poll and read — re-render.
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e).context("reading stdin"),
             }
-            Err(e) => return Err(e).context("reading stdin"),
+
+            // On-activity reconnect. A keystroke or focus event got us
+            // here, so if we're unsubscribed, try to climb back to push
+            // mode. The subscribe is cheap and self-correcting: if the
+            // daemon still can't serve events, the next poll sees EOF
+            // and we drop back. Gating on `ready.stdin` is what keeps an
+            // event-driven EOF from spinning (teardown → resubscribe →
+            // EOF → …) — we only retry when the user actually did
+            // something, never off our own fallback refresh.
+            if events.is_none() && !model.quit {
+                events = EventsSub::spawn(flags);
+                model.events_active = events.is_some();
+            }
         }
     }
 }
@@ -235,10 +298,11 @@ fn run_cascade<W: Write>(
     raw: &tty::RawMode,
     alt: &tty::AltScreen,
     flags: &Flags,
+    events: &mut Option<EventsSub>,
 ) -> Result<()> {
     let mut next = tui::update(model, event);
     while let Some(cmd) = next.take() {
-        let follow_up = execute(cmd, model, out, raw, alt, flags)?;
+        let follow_up = execute(cmd, model, out, raw, alt, flags, events)?;
         let Some(ev) = follow_up else { break };
         next = tui::update(model, ev);
     }
@@ -256,6 +320,7 @@ fn execute<W: Write>(
     raw: &tty::RawMode,
     alt: &tty::AltScreen,
     flags: &Flags,
+    events: &mut Option<EventsSub>,
 ) -> Result<Option<Event>> {
     match cmd {
         Command::Quit => {
@@ -299,6 +364,12 @@ fn execute<W: Write>(
                 Ok(Some(Event::SessionsRefreshed(sessions)))
             }
             Preflight::ClearToAttach => {
+                // Drop the subscriber for the duration of the attached
+                // session: we're about to block in the child and can't
+                // drain its pipe, so the daemon would drop us as a slow
+                // subscriber anyway. main_loop's on-activity reconnect
+                // brings it back when the attach returns.
+                teardown_events(events, model);
                 let ok =
                     with_tui_suspended(out, raw, alt, || shell_attach(&name, force, flags))?;
                 Ok(Some(Event::AttachExited { ok, name }))
@@ -308,6 +379,7 @@ fn execute<W: Write>(
             // Duplicate-name check happened in update; by here it's
             // safe to spawn. `shpool attach` with a new name creates
             // atomically on the daemon side.
+            teardown_events(events, model);
             let ok = with_tui_suspended(out, raw, alt, || shell_attach(&name, false, flags))?;
             Ok(Some(Event::AttachExited { ok, name }))
         }
@@ -395,6 +467,14 @@ fn shell_kill(name: &str, flags: &Flags) -> Result<(bool, Option<String>)> {
         }
     };
     Ok((ok, err))
+}
+
+/// Drop the events subscriber and reflect that on the model. The
+/// `EventsSub` Drop kills + reaps the child, so this won't block even
+/// though the child sits reading the daemon socket.
+fn teardown_events(events: &mut Option<EventsSub>, model: &mut Model) {
+    *events = None;
+    model.events_active = false;
 }
 
 #[cfg(test)]

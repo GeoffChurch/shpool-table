@@ -286,19 +286,24 @@ pub fn render(
     } else {
         let now = now_ms;
         let max_visible = (height as usize).saturating_sub(CHROME_LINES);
-        let (start, end) = viewport(model.sessions.len(), model.selected, max_visible);
+        // `None` in the cleared/stale states — anchor the viewport at
+        // the top and light up no row.
+        let selected = model.selected_index();
+        let (start, end) =
+            viewport(model.sessions.len(), selected.unwrap_or(0), max_visible);
 
         for (i, s) in model.sessions[start..end].iter().enumerate() {
             let abs_i = start + i;
+            let is_selected = selected == Some(abs_i);
             // 2-char prefix: [attached marker][selected arrow]. An
             // asterisk marks sessions attached elsewhere so the user
             // sees the "already attached" state without having to
             // hit Enter and get the pre-flight rejection. ASCII so
             // we don't depend on the terminal's locale/font.
             let dot = if s.attached { '*' } else { ' ' };
-            let arrow = if abs_i == model.selected { '>' } else { ' ' };
+            let arrow = if is_selected { '>' } else { ' ' };
             let created = format_age(now, s.started_at_unix_ms);
-            let active = format_age(now, s.last_active_unix_ms());
+            let active = format_age(now, s.last_touched_unix_ms());
             let text = clip(
                 &format!(
                     "{dot}{arrow}{name:<name_width$}{gap}{created:<created_width$}{gap}{active:<active_width$}",
@@ -307,7 +312,7 @@ pub fn render(
                 ),
                 w,
             );
-            if abs_i == model.selected {
+            if is_selected {
                 write!(out, "{SGR_SELECTED}{text:<w$}{SGR_RESET}\r\n")?;
             } else {
                 write!(out, "{text:<w$}\r\n")?;
@@ -315,19 +320,30 @@ pub fn render(
         }
     }
 
-    let bottom = if let Some(err) = &model.error {
-        error_label(err)
-    } else {
-        match &model.mode {
-            Mode::Normal => normal_bindings_label(),
-            Mode::CreateInput(input) => create_input_label(input),
-            Mode::ConfirmKill(name) => confirm_kill_label(name),
-            Mode::ConfirmForce(name) => confirm_force_label(name),
-        }
-    };
-    render_bar(out, w, &bottom, BarAlign::Left)?;
+    render_bar(out, w, &bottom_bar_label(model), BarAlign::Left)?;
 
     Ok(())
+}
+
+/// The bottom-bar contents, in priority order: an active modal prompt
+/// outranks a transient error, which outranks the idle key bindings.
+///
+/// Modal-over-error matters once background refreshes can raise errors
+/// mid-prompt. If an error covered the create / confirm prompt, the
+/// user would be typing or confirming blind, and a stray Enter to clear
+/// the error would commit whatever sat underneath. The error isn't
+/// lost — it resurfaces the moment we're back in Normal mode (where the
+/// stale-selection ack handles it).
+fn bottom_bar_label(model: &Model) -> Label {
+    match &model.mode {
+        Mode::CreateInput(input) => create_input_label(input),
+        Mode::ConfirmKill(name) => confirm_kill_label(name),
+        Mode::ConfirmForce(name) => confirm_force_label(name),
+        Mode::Normal => match &model.error {
+            Some(err) => error_label(err),
+            None => normal_bindings_label(),
+        },
+    }
 }
 
 /// Compute the visible window [start, end) that keeps `selected` on screen.
@@ -345,6 +361,7 @@ fn viewport(total: usize, selected: usize, max_visible: usize) -> (usize, usize)
 mod tests {
     use super::*;
     use crate::session::Session;
+    use crate::tui::model::Selection;
 
     // Fixed "now" used by the snapshot tests so relative-age columns
     // are deterministic. 2026-01-15 22:30 UTC.
@@ -415,7 +432,7 @@ mod tests {
             sess("main", true, NOW_MS - 2 * 60 * 1000),
             sess("build", false, NOW_MS - 3 * 60 * 60 * 1000),
         ]);
-        m.selected = 1;
+        m.selection = Selection::At(1);
         insta::assert_snapshot!(render_visible(&m, 70, 6));
     }
 
@@ -465,5 +482,47 @@ mod tests {
     #[test]
     fn viewport_centers_selected() {
         assert_eq!(viewport(20, 10, 5), (8, 13));
+    }
+
+    #[test]
+    fn modal_prompt_outranks_error() {
+        // A background error must not paper over the create prompt.
+        let mut m = Model::new(vec![sess("main", false, NOW_MS)]);
+        m.mode = Mode::CreateInput("foo".into());
+        m.set_error("daemon gone");
+        let label = strip_ansi(&bottom_bar_label(&m).styled);
+        assert!(label.contains("new session"), "got: {label:?}");
+        assert!(!label.contains("daemon gone"), "got: {label:?}");
+    }
+
+    #[test]
+    fn confirm_prompt_outranks_error() {
+        let mut m = Model::new(vec![sess("main", false, NOW_MS)]);
+        m.mode = Mode::ConfirmKill("main".into());
+        m.set_error("daemon gone");
+        let label = strip_ansi(&bottom_bar_label(&m).styled);
+        assert!(label.contains("kill"), "got: {label:?}");
+        assert!(!label.contains("daemon gone"), "got: {label:?}");
+    }
+
+    #[test]
+    fn error_shows_in_normal_mode() {
+        let mut m = Model::new(vec![sess("main", false, NOW_MS)]);
+        m.set_error("daemon gone");
+        let label = strip_ansi(&bottom_bar_label(&m).styled);
+        assert!(label.contains("daemon gone"), "got: {label:?}");
+    }
+
+    #[test]
+    fn stale_selection_suppresses_highlight() {
+        // No row should carry the reverse-video highlight or `>` arrow
+        // while the selection is stale; the bottom bar shows the error.
+        let mut m = Model::new(vec![
+            sess("main", false, NOW_MS - 60 * 1000),
+            sess("build", false, NOW_MS - 5 * 60 * 1000),
+        ]);
+        m.selection = Selection::Stale("gone".into());
+        m.set_error("session 'gone' is gone");
+        insta::assert_snapshot!(render_visible(&m, 70, 6));
     }
 }

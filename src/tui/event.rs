@@ -12,8 +12,15 @@ pub enum Event {
 
     /// The terminal window regained focus. Triggers a Refresh — the
     /// user was likely away, so session state may have changed while
-    /// they weren't looking.
+    /// they weren't looking. Skipped while an events subscription is
+    /// live (it already keeps the list current).
     FocusGained,
+
+    /// The `shpool events` subscription reported daemon-side activity.
+    /// The payload is content-free — any event just means "re-list" —
+    /// so `update` maps this straight to Command::Refresh. Emitted by
+    /// the main loop, never by the parser.
+    EventsArrived,
 
     /// The `shpool list --json` shell-out returned a fresh session
     /// list. `update` applies it to the model and emits no Command.
