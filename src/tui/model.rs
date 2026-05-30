@@ -54,8 +54,11 @@ pub struct Model {
 
 impl Model {
     pub fn new(sessions: Vec<Session>) -> Self {
-        let selection =
-            if sessions.is_empty() { Selection::None } else { Selection::At(0) };
+        let selection = if sessions.is_empty() {
+            Selection::None
+        } else {
+            Selection::At(0)
+        };
         Self {
             sessions,
             selection,
@@ -130,7 +133,9 @@ impl Model {
     /// refresh re-selects the neighbor by name instead of raising a
     /// spurious stale alert for a disappearance the user caused.
     pub fn advance_off(&mut self, name: &str) {
-        let Selection::At(i) = self.selection else { return };
+        let Selection::At(i) = self.selection else {
+            return;
+        };
         if self.sessions.get(i).map(|s| s.name.as_str()) != Some(name) {
             return;
         }

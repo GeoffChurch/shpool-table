@@ -34,9 +34,7 @@ impl RawMode {
     /// (`shpool attach`) see a cooked terminal, then we restore raw
     /// mode when they exit.
     pub fn suspend(&self) -> Result<()> {
-        let rc = unsafe {
-            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.saved)
-        };
+        let rc = unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.saved) };
         if rc != 0 {
             return Err(io::Error::last_os_error()).context("tcsetattr cooked");
         }
@@ -68,8 +66,7 @@ impl Drop for RawMode {
 /// Query the terminal size as (cols, rows).
 pub fn tty_size() -> Result<(u16, u16)> {
     let mut ws = MaybeUninit::<libc::winsize>::uninit();
-    let rc =
-        unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, ws.as_mut_ptr()) };
+    let rc = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, ws.as_mut_ptr()) };
     if rc != 0 {
         return Err(io::Error::last_os_error()).context("ioctl TIOCGWINSZ");
     }
@@ -111,8 +108,16 @@ pub fn poll_readable(events_fd: Option<RawFd>) -> io::Result<Ready> {
     // A negative fd is ignored by poll(2), so the events slot is inert
     // while there's no subscription.
     let mut fds = [
-        libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 },
-        libc::pollfd { fd: events_fd.unwrap_or(-1), events: libc::POLLIN, revents: 0 },
+        libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: events_fd.unwrap_or(-1),
+            events: libc::POLLIN,
+            revents: 0,
+        },
     ];
     let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
     if rc < 0 {
@@ -134,7 +139,11 @@ pub fn poll_readable(events_fd: Option<RawFd>) -> io::Result<Ready> {
 /// visible to the caller (Rust's std Read silently retries on EINTR).
 pub fn read_stdin(buf: &mut [u8]) -> io::Result<usize> {
     let n = unsafe {
-        libc::read(libc::STDIN_FILENO, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+        libc::read(
+            libc::STDIN_FILENO,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+        )
     };
     if n < 0 {
         Err(io::Error::last_os_error())

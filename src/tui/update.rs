@@ -10,7 +10,7 @@
 
 use super::command::Command;
 use super::event::Event;
-use super::keymap::{normal_action, Key, NormalAction};
+use super::keymap::{Key, NormalAction, normal_action};
 use super::model::{Mode, Model, Selection};
 
 /// Fold one event into the model. Returns `Some(Command)` if the
@@ -83,10 +83,7 @@ pub fn update(model: &mut Model, event: Event) -> Option<Command> {
     // CreateInput isn't three shell-outs, and skipped while subscribed —
     // the event stream already keeps us current, so this fallback would
     // only double the list calls.
-    if was_keystroke
-        && cmd.is_none()
-        && matches!(model.mode, Mode::Normal)
-        && !model.events_active
+    if was_keystroke && cmd.is_none() && matches!(model.mode, Mode::Normal) && !model.events_active
     {
         return Some(Command::Refresh);
     }
@@ -293,7 +290,10 @@ mod tests {
         assert_eq!(update(&mut m, key(Key::Down)), Some(Command::Refresh));
         assert_eq!(
             update(&mut m, key(Key::Enter)),
-            Some(Command::Attach { name: "b".into(), force: false }),
+            Some(Command::Attach {
+                name: "b".into(),
+                force: false
+            }),
         );
     }
 
@@ -303,7 +303,10 @@ mod tests {
         assert_eq!(update(&mut m, key(Key::Up)), Some(Command::Refresh));
         assert_eq!(
             update(&mut m, key(Key::Enter)),
-            Some(Command::Attach { name: "z".into(), force: false }),
+            Some(Command::Attach {
+                name: "z".into(),
+                force: false
+            }),
         );
     }
 
@@ -469,7 +472,10 @@ mod tests {
         let mut m = Model::new(vec![mk("a"), mk("b")]);
         m.selection = Selection::At(0); // "a"
         m.mode = Mode::ConfirmKill("a".into());
-        assert_eq!(update(&mut m, key(Key::Char(b'y'))), Some(Command::Kill("a".into())));
+        assert_eq!(
+            update(&mut m, key(Key::Char(b'y'))),
+            Some(Command::Kill("a".into()))
+        );
         assert_eq!(m.selected_name(), Some("b"));
     }
 
@@ -489,7 +495,10 @@ mod tests {
         m.mode = Mode::ConfirmForce("a".into());
         assert_eq!(
             update(&mut m, key(Key::Char(b'y'))),
-            Some(Command::Attach { name: "a".into(), force: true }),
+            Some(Command::Attach {
+                name: "a".into(),
+                force: true
+            }),
         );
         assert_eq!(m.mode, Mode::Normal);
     }
@@ -532,7 +541,10 @@ mod tests {
         m.selection = Selection::At(0);
         let cmd = update(
             &mut m,
-            Event::AttachExited { ok: true, name: "c".into() },
+            Event::AttachExited {
+                ok: true,
+                name: "c".into(),
+            },
         );
         assert_eq!(cmd, Some(Command::Refresh));
         assert_eq!(m.selected_index(), Some(2));
@@ -544,7 +556,10 @@ mod tests {
         let mut m = Model::new(vec![mk("a")]);
         let cmd = update(
             &mut m,
-            Event::AttachExited { ok: false, name: "a".into() },
+            Event::AttachExited {
+                ok: false,
+                name: "a".into(),
+            },
         );
         assert_eq!(cmd, Some(Command::Refresh));
         assert!(m.error.as_deref().unwrap_or("").contains("shpool attach"));
@@ -555,7 +570,11 @@ mod tests {
         let mut m = Model::new(vec![mk("a")]);
         let cmd = update(
             &mut m,
-            Event::KillFinished { ok: true, name: "a".into(), err: None },
+            Event::KillFinished {
+                ok: true,
+                name: "a".into(),
+                err: None,
+            },
         );
         assert_eq!(cmd, Some(Command::Refresh));
         assert!(m.error.is_none());
@@ -635,7 +654,10 @@ mod tests {
         update(&mut m, key(Key::Char(b'j')));
         assert_eq!(
             update(&mut m, key(Key::Enter)),
-            Some(Command::Attach { name: "c".into(), force: false }),
+            Some(Command::Attach {
+                name: "c".into(),
+                force: false
+            }),
         );
     }
 
@@ -752,7 +774,13 @@ mod tests {
         let mut m = Model::new(vec![mk("a")]);
         m.selection = Selection::Stale("old".into());
         m.set_error("session 'old' is gone");
-        let cmd = update(&mut m, Event::AttachExited { ok: true, name: "a".into() });
+        let cmd = update(
+            &mut m,
+            Event::AttachExited {
+                ok: true,
+                name: "a".into(),
+            },
+        );
         assert_eq!(cmd, Some(Command::Refresh));
         assert!(!m.is_stale());
         assert!(m.error.is_none());

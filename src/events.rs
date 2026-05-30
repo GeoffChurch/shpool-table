@@ -50,7 +50,11 @@ impl EventsSub {
 
     /// The pipe's read fd, for `poll`. Valid for the lifetime of `self`.
     pub fn fd(&self) -> RawFd {
-        self.child.stdout.as_ref().expect("events stdout is piped").as_raw_fd()
+        self.child
+            .stdout
+            .as_ref()
+            .expect("events stdout is piped")
+            .as_raw_fd()
     }
 
     /// Read whatever is ready (one pipe-sized gulp) and discard it — the

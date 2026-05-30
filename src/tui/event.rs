@@ -41,5 +41,9 @@ pub enum Event {
     /// `err` carries a display-ready message if it failed. `update`
     /// surfaces the error and emits Command::Refresh so the list
     /// reflects the (potentially now-missing) session.
-    KillFinished { ok: bool, name: String, err: Option<String> },
+    KillFinished {
+        ok: bool,
+        name: String,
+        err: Option<String>,
+    },
 }

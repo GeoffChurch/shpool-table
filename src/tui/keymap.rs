@@ -122,7 +122,10 @@ pub const CONFIRM_FORCE_HINTS: &[(&str, &str)] = &[("y", "force"), ("n", "cancel
 /// Linear scan; the table is ~20 entries and this runs at most once
 /// per keystroke, so a HashMap would be over-engineering.
 pub fn normal_action(key: Key) -> Option<NormalAction> {
-    NORMAL_BINDINGS.iter().find(|b| b.keys.contains(&key)).map(|b| b.action)
+    NORMAL_BINDINGS
+        .iter()
+        .find(|b| b.keys.contains(&key))
+        .map(|b| b.action)
 }
 
 #[cfg(test)]
@@ -134,16 +137,37 @@ mod tests {
     fn normal_action_maps_bindings() {
         assert_eq!(normal_action(Key::Up), Some(NormalAction::SelectPrev));
         assert_eq!(normal_action(Key::Down), Some(NormalAction::SelectNext));
-        assert_eq!(normal_action(Key::Enter), Some(NormalAction::AttachSelected));
-        assert_eq!(normal_action(Key::Char(b' ')), Some(NormalAction::AttachSelected));
+        assert_eq!(
+            normal_action(Key::Enter),
+            Some(NormalAction::AttachSelected)
+        );
+        assert_eq!(
+            normal_action(Key::Char(b' ')),
+            Some(NormalAction::AttachSelected)
+        );
         assert_eq!(normal_action(Key::Char(b'q')), Some(NormalAction::Quit));
         assert_eq!(normal_action(Key::Char(b'Q')), Some(NormalAction::Quit));
         assert_eq!(normal_action(Key::Ctrl(0x03)), Some(NormalAction::Quit));
-        assert_eq!(normal_action(Key::Char(b'n')), Some(NormalAction::NewSession));
-        assert_eq!(normal_action(Key::Char(b'd')), Some(NormalAction::KillSelected));
-        assert_eq!(normal_action(Key::Char(b'D')), Some(NormalAction::EnsureDaemon));
-        assert_eq!(normal_action(Key::Char(b'j')), Some(NormalAction::SelectNext));
-        assert_eq!(normal_action(Key::Char(b'k')), Some(NormalAction::SelectPrev));
+        assert_eq!(
+            normal_action(Key::Char(b'n')),
+            Some(NormalAction::NewSession)
+        );
+        assert_eq!(
+            normal_action(Key::Char(b'd')),
+            Some(NormalAction::KillSelected)
+        );
+        assert_eq!(
+            normal_action(Key::Char(b'D')),
+            Some(NormalAction::EnsureDaemon)
+        );
+        assert_eq!(
+            normal_action(Key::Char(b'j')),
+            Some(NormalAction::SelectNext)
+        );
+        assert_eq!(
+            normal_action(Key::Char(b'k')),
+            Some(NormalAction::SelectPrev)
+        );
         assert_eq!(normal_action(Key::Esc), None);
         assert_eq!(normal_action(Key::Other), None);
     }

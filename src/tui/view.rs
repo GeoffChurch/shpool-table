@@ -1,8 +1,6 @@
 use std::io::{self, Write};
 
-use super::keymap::{
-    CONFIRM_FORCE_HINTS, CONFIRM_KILL_HINTS, CREATE_HINTS, NORMAL_BINDINGS,
-};
+use super::keymap::{CONFIRM_FORCE_HINTS, CONFIRM_KILL_HINTS, CREATE_HINTS, NORMAL_BINDINGS};
 use super::model::{Mode, Model};
 
 // SGR codes for the bar chrome. The chrome reads as a phosphor-amber
@@ -279,7 +277,10 @@ pub fn render(
         ),
         w,
     );
-    write!(out, "{SGR_BAR_BG}{SGR_AMBER_DIM}{header:<w$}{SGR_RESET}\r\n")?;
+    write!(
+        out,
+        "{SGR_BAR_BG}{SGR_AMBER_DIM}{header:<w$}{SGR_RESET}\r\n"
+    )?;
 
     if model.sessions.is_empty() {
         out.write_all(b"  (no sessions)\r\n")?;
@@ -289,8 +290,7 @@ pub fn render(
         // `None` in the cleared/stale states — anchor the viewport at
         // the top and light up no row.
         let selected = model.selected_index();
-        let (start, end) =
-            viewport(model.sessions.len(), selected.unwrap_or(0), max_visible);
+        let (start, end) = viewport(model.sessions.len(), selected.unwrap_or(0), max_visible);
 
         for (i, s) in model.sessions[start..end].iter().enumerate() {
             let abs_i = start + i;

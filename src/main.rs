@@ -70,7 +70,10 @@ impl Flags {
 /// a fixed value; production passes the current time).
 fn now_unix_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn fetch_sessions(flags: &Flags) -> Result<Vec<Session>> {
@@ -218,7 +221,15 @@ fn main_loop<W: Write>(
         if ready.events {
             match events.as_mut().map(EventsSub::drain) {
                 Some(Drain::Activity) => {
-                    run_cascade(model, Event::EventsArrived, out, raw, alt, flags, &mut events)?;
+                    run_cascade(
+                        model,
+                        Event::EventsArrived,
+                        out,
+                        raw,
+                        alt,
+                        flags,
+                        &mut events,
+                    )?;
                 }
                 Some(Drain::Eof) => {
                     // Subscription ended: daemon down, slow-subscriber
@@ -228,7 +239,15 @@ fn main_loop<W: Write>(
                     // should know push has paused. A specific list error
                     // (daemon truly down) outranks the generic notice.
                     teardown_events(&mut events, model);
-                    run_cascade(model, Event::EventsArrived, out, raw, alt, flags, &mut events)?;
+                    run_cascade(
+                        model,
+                        Event::EventsArrived,
+                        out,
+                        raw,
+                        alt,
+                        flags,
+                        &mut events,
+                    )?;
                     if model.error.is_none() {
                         model.set_error(
                             "events unavailable — refreshing on keypress (D to reconnect)",
@@ -370,8 +389,7 @@ fn execute<W: Write>(
                 // subscriber anyway. main_loop's on-activity reconnect
                 // brings it back when the attach returns.
                 teardown_events(events, model);
-                let ok =
-                    with_tui_suspended(out, raw, alt, || shell_attach(&name, force, flags))?;
+                let ok = with_tui_suspended(out, raw, alt, || shell_attach(&name, force, flags))?;
                 Ok(Some(Event::AttachExited { ok, name }))
             }
         },
@@ -421,7 +439,11 @@ fn preflight_attach(name: &str, force: bool, flags: &Flags) -> Preflight {
         return Preflight::Gone { sessions };
     }
     let attached_elsewhere = !force
-        && sessions.iter().find(|s| s.name == name).map(|s| s.attached).unwrap_or(false);
+        && sessions
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| s.attached)
+            .unwrap_or(false);
     if attached_elsewhere {
         return Preflight::AttachedElsewhere { sessions };
     }
@@ -482,7 +504,9 @@ mod tests {
     use super::*;
 
     fn args_of(cmd: &process::Command) -> Vec<String> {
-        cmd.get_args().map(|s| s.to_string_lossy().into_owned()).collect()
+        cmd.get_args()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect()
     }
 
     #[test]
@@ -508,10 +532,14 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                "--config-file", "/etc/shpool/custom.toml",
-                "--log-file", "/var/log/shpool.log",
-                "-v", "-v",
-                "--socket", "/tmp/shpool.sock",
+                "--config-file",
+                "/etc/shpool/custom.toml",
+                "--log-file",
+                "/var/log/shpool.log",
+                "-v",
+                "-v",
+                "--socket",
+                "/tmp/shpool.sock",
             ],
         );
     }
@@ -534,7 +562,10 @@ mod tests {
         let list_pos = args.iter().position(|a| a == "list").expect("list present");
         for flag in ["--config-file", "--log-file", "-v", "--socket"] {
             let pos = args.iter().position(|a| a == flag).expect(flag);
-            assert!(pos < list_pos, "{flag} must come before `list`; got {args:?}");
+            assert!(
+                pos < list_pos,
+                "{flag} must come before `list`; got {args:?}"
+            );
         }
     }
 }
