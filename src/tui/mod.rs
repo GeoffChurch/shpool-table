@@ -12,4 +12,4 @@ pub use event::Event;
 pub use model::{Mode, Model};
 pub use parser::{Input, InputParser};
 pub use update::update;
-pub use view::render;
+pub use view::{next_render_delay_ms, render};

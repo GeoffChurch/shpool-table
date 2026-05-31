@@ -196,7 +196,8 @@ fn main_loop<W: Write>(
     let mut buf = [0u8; 16];
     loop {
         let (w, h) = tty::tty_size().unwrap_or((80, 24));
-        tui::render(model, w, h, now_unix_ms(), out)?;
+        let now = now_unix_ms();
+        tui::render(model, w, h, now, out)?;
         out.flush()?;
 
         // `quit` is checked AFTER the draw, not before. The final
@@ -208,7 +209,13 @@ fn main_loop<W: Write>(
             return Ok(());
         }
 
-        let ready = match tty::poll_readable(events.as_ref().map(EventsSub::fd)) {
+        // Wake on input, a push event, or — so the relative-age columns
+        // advance while the table is idle — when the soonest on-screen age
+        // would next change. A pure-timeout wake just re-renders with a
+        // fresh `now`; it sets neither ready flag, so it can't be mistaken
+        // for user activity (no reconnect) or a push (no refresh).
+        let timeout = tui::next_render_delay_ms(model, now);
+        let ready = match tty::poll_readable(events.as_ref().map(EventsSub::fd), timeout) {
             Ok(r) => r,
             // SIGWINCH — loop back to re-query tty_size and redraw.
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -499,6 +506,39 @@ fn teardown_events(events: &mut Option<EventsSub>, model: &mut Model) {
     model.events_active = false;
 }
 
+/// Tear the TUI down (leave alt-screen, cooked mode), run `f`, then
+/// put the TUI back up. Used for the attach subprocess, which needs a
+/// clean cooked tty to take over.
+///
+/// Restores terminal state on both success and error return paths of
+/// `f` so an attach that failed halfway still hands us back a usable
+/// TUI.
+fn with_tui_suspended<F, R, W: Write>(
+    out: &mut W,
+    raw: &tty::RawMode,
+    alt: &tty::AltScreen,
+    f: F,
+) -> Result<R>
+where
+    F: FnOnce() -> Result<R>,
+{
+    alt.suspend()?;
+    // Clear the primary screen before the child starts so its first
+    // frame doesn't land on top of leftover shell prompt history.
+    tty::clear_screen(out)?;
+    out.flush()?;
+    raw.suspend()?;
+
+    // Capture the result so we still restore the terminal on error.
+    let result = f();
+
+    raw.resume()?;
+    alt.resume()?;
+    out.flush()?;
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -568,37 +608,4 @@ mod tests {
             );
         }
     }
-}
-
-/// Tear the TUI down (leave alt-screen, cooked mode), run `f`, then
-/// put the TUI back up. Used for the attach subprocess, which needs a
-/// clean cooked tty to take over.
-///
-/// Restores terminal state on both success and error return paths of
-/// `f` so an attach that failed halfway still hands us back a usable
-/// TUI.
-fn with_tui_suspended<F, R, W: Write>(
-    out: &mut W,
-    raw: &tty::RawMode,
-    alt: &tty::AltScreen,
-    f: F,
-) -> Result<R>
-where
-    F: FnOnce() -> Result<R>,
-{
-    alt.suspend()?;
-    // Clear the primary screen before the child starts so its first
-    // frame doesn't land on top of leftover shell prompt history.
-    tty::clear_screen(out)?;
-    out.flush()?;
-    raw.suspend()?;
-
-    // Capture the result so we still restore the terminal on error.
-    let result = f();
-
-    raw.resume()?;
-    alt.resume()?;
-    out.flush()?;
-
-    result
 }

@@ -182,7 +182,7 @@ mod tests {
         let mut out = vec![];
         p.feed(&[0x1b, b'['], &mut out);
         assert!(out.is_empty());
-        p.feed(&[b'B'], &mut out);
+        p.feed(b"B", &mut out);
         assert_eq!(out, vec![Input::Key(Key::Down)]);
     }
 

@@ -100,11 +100,13 @@ pub struct Ready {
 }
 
 /// Block until stdin and/or `events_fd` (when subscribed) is readable,
-/// reporting which. A signal (SIGWINCH) interrupts the wait and surfaces
-/// as `ErrorKind::Interrupted`, so the caller re-renders — the same
-/// contract `read_stdin` has. Infinite timeout: we wake only on input,
-/// a push event, or a signal, so an idle table costs nothing.
-pub fn poll_readable(events_fd: Option<RawFd>) -> io::Result<Ready> {
+/// or `timeout_ms` elapses (`None` blocks indefinitely), reporting which
+/// fds are ready. A signal (SIGWINCH) interrupts the wait and surfaces as
+/// `ErrorKind::Interrupted`, so the caller re-renders — the same contract
+/// `read_stdin` has. On a pure timeout (nothing ready) both flags come
+/// back false and the caller just re-renders with a fresh clock, which is
+/// how the relative-age columns keep ticking while the table is idle.
+pub fn poll_readable(events_fd: Option<RawFd>, timeout_ms: Option<u64>) -> io::Result<Ready> {
     // A negative fd is ignored by poll(2), so the events slot is inert
     // while there's no subscription.
     let mut fds = [
@@ -119,7 +121,9 @@ pub fn poll_readable(events_fd: Option<RawFd>) -> io::Result<Ready> {
             revents: 0,
         },
     ];
-    let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+    // None -> -1 (block forever); otherwise saturate into poll's c_int ms.
+    let timeout = timeout_ms.map_or(-1, |ms| ms.min(i32::MAX as u64) as libc::c_int);
+    let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
     }

@@ -240,6 +240,46 @@ fn format_age(now_ms: u64, then_ms: u64) -> String {
     format!("{}d", hours / 24)
 }
 
+/// Milliseconds until the soonest on-screen relative-age string would
+/// change, or `None` when there's nothing to tick (empty list). Drives
+/// the poll timeout so the "created"/"active" columns advance on their
+/// own while the table is idle, without waking any more often than the
+/// coarsest visible unit needs: per-second only while something is
+/// sub-minute, per-minute in the "Nm" band, and so on up to per-day.
+///
+/// Computed over every session (not just the viewport) — cheap, and the
+/// youngest session sets the cadence regardless of whether it's scrolled
+/// into view. Floored at 100ms so a cluster of sessions straddling a
+/// boundary can't provoke a flurry of sub-frame wakes.
+pub fn next_render_delay_ms(model: &Model, now_ms: u64) -> Option<u64> {
+    model
+        .sessions
+        .iter()
+        .flat_map(|s| [s.started_at_unix_ms, s.last_touched_unix_ms()])
+        .map(|then| ms_until_age_changes(now_ms.saturating_sub(then)))
+        .min()
+        .map(|ms| ms.max(100))
+}
+
+/// Milliseconds until `format_age` would render a different string for a
+/// value currently `age_ms` old — the distance to the next bucket edge.
+/// Mirrors `format_age`'s thresholds, so the two stay in lockstep.
+fn ms_until_age_changes(age_ms: u64) -> u64 {
+    const SEC: u64 = 1_000;
+    let secs = age_ms / SEC;
+    if secs < 5 {
+        5 * SEC - age_ms // "now" -> "5s"
+    } else if secs < 60 {
+        SEC - age_ms % SEC // next whole second
+    } else if secs < 3600 {
+        60 * SEC - age_ms % (60 * SEC) // next whole minute
+    } else if secs < 86_400 {
+        3_600 * SEC - age_ms % (3_600 * SEC) // next whole hour
+    } else {
+        86_400 * SEC - age_ms % (86_400 * SEC) // next whole day
+    }
+}
+
 pub fn render(
     model: &Model,
     width: u16,
@@ -524,5 +564,41 @@ mod tests {
         m.selection = Selection::Stale("gone".into());
         m.set_error("session 'gone' is gone");
         insta::assert_snapshot!(render_visible(&m, 70, 6));
+    }
+
+    #[test]
+    fn age_tick_distances_match_format_age_buckets() {
+        assert_eq!(ms_until_age_changes(0), 5_000); // "now" -> "5s"
+        assert_eq!(ms_until_age_changes(2_000), 3_000);
+        assert_eq!(ms_until_age_changes(5_000), 1_000); // 5s -> 6s
+        assert_eq!(ms_until_age_changes(5_400), 600);
+        assert_eq!(ms_until_age_changes(90_000), 30_000); // 1m band -> next minute
+        assert_eq!(ms_until_age_changes(3_600_000), 3_600_000); // 1h -> 2h
+        assert_eq!(ms_until_age_changes(86_400_000), 86_400_000); // 1d -> 2d
+    }
+
+    #[test]
+    fn next_delay_tracks_the_youngest_session() {
+        let now = NOW_MS;
+        let m = Model::new(vec![
+            sess("old", false, now - 5 * 3600 * 1000), // 5h old
+            sess("young", false, now - 7_300),         // 7.3s old
+        ]);
+        // The young session is in the per-second band, so the next wake is
+        // its sub-second remainder (700ms), not the old one's hour-scale.
+        assert_eq!(next_render_delay_ms(&m, now), Some(700));
+    }
+
+    #[test]
+    fn next_delay_is_floored_to_avoid_sub_frame_wakes() {
+        let now = NOW_MS;
+        // 4.99s old: the raw distance to "5s" is 10ms, floored to 100ms.
+        let m = Model::new(vec![sess("a", false, now - 4_990)]);
+        assert_eq!(next_render_delay_ms(&m, now), Some(100));
+    }
+
+    #[test]
+    fn empty_list_never_ticks() {
+        assert_eq!(next_render_delay_ms(&Model::new(vec![]), NOW_MS), None);
     }
 }
