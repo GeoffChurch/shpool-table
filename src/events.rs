@@ -40,8 +40,17 @@ impl EventsSub {
     pub fn spawn(flags: &Flags) -> Option<Self> {
         let mut cmd = Command::new("shpool");
         flags.apply(&mut cmd);
-        cmd.arg("events")
-            .stdin(Stdio::null())
+        cmd.arg("events");
+        Self::spawn_cmd(cmd)
+    }
+
+    /// Apply the standard stdio wiring — stdout piped so we can read the
+    /// event stream, stdin and stderr silenced — and spawn. Split out of
+    /// `spawn` so tests can drive the drain/teardown machinery through a
+    /// stub program (e.g. `sh -c …`) using the very same pipe setup the
+    /// real subscriber runs with, no live daemon required.
+    fn spawn_cmd(mut cmd: Command) -> Option<Self> {
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         let child = cmd.spawn().ok()?;
@@ -84,5 +93,58 @@ impl Drop for EventsSub {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    /// A stub subscriber: `sh -c <script>` through the real stdio wiring,
+    /// standing in for `shpool events` so we can test drain/teardown with
+    /// no daemon. `sh` is POSIX-ubiquitous (present on the CI runner).
+    fn stub(script: &str) -> EventsSub {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", script]);
+        EventsSub::spawn_cmd(cmd).expect("spawn sh stub")
+    }
+
+    #[test]
+    fn drain_reports_activity_then_eof() {
+        let mut sub = stub("printf x");
+        // The byte the child wrote reads back as activity (we discard it)...
+        assert!(matches!(sub.drain(), Drain::Activity));
+        // ...and the now-closed pipe reads back as EOF.
+        assert!(matches!(sub.drain(), Drain::Eof));
+    }
+
+    #[test]
+    fn drain_reports_eof_when_stream_closes_empty() {
+        // A subscriber that produces nothing and exits — the daemon-down /
+        // no-events-socket shape — drains straight to EOF.
+        let mut sub = stub("exit 0");
+        assert!(matches!(sub.drain(), Drain::Eof));
+    }
+
+    #[test]
+    fn drop_kills_and_reaps_without_awaiting_child_lifetime() {
+        // The child would live 30s; Drop must SIGKILL then reap it
+        // promptly, not wait() out its natural life. If kill didn't
+        // precede wait, this would hang for ~30s.
+        let sub = stub("sleep 30");
+        let start = Instant::now();
+        drop(sub);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "Drop blocked on the child's lifetime — kill must precede wait",
+        );
+    }
+
+    #[test]
+    fn fd_is_exposed_while_live() {
+        let sub = stub("sleep 30");
+        assert!(sub.fd() >= 0, "piped stdout should yield a real fd");
     }
 }
