@@ -3,12 +3,12 @@
 A lightweight TUI for managing [shpool] sessions. shpool-table is written in Rust. [shperl] is its counterpart in Perl.
 
 ```
-                          shpool (3 sessions)
+                           shpool (3 sessions)
   name       created  active
- >acme -nw   2h       now
+*>acme -nw   2h       now
   stuxnet    2h       1m
 * djt-miner  1d       3h
-  j down   k up   spc attach   n new   d kill   D daemon   q quit
+  j down   k up   spc attach   n new   d kill   D daemon   v vars   q quit
 ```
 
 `shpool-table` is **not** a shpool session itself — it's a standalone
@@ -17,6 +17,18 @@ and spawns `shpool attach` when you pick one. When you detach from a
 session (via shpool's detach keybinding), you land back in the manager's
 menu. It requires **zero changes to shpool** — the daemon doesn't know
 the manager exists.
+
+Press `v` to manage `shpool`'s template variables and their attached sessions.
+
+```
+                              variables (2)
+ > coin   = djt   (1 session)
+   editor = acme   (1 session)
+
+  {coin} attachments:
+    {coin}-miner             djt-miner        pid 4321  -> xmr-miner
+  set coin = xmr_   (ret: apply, esc: cancel)
+```
 
 [shpool]: https://github.com/shell-pool/shpool
 [shperl]: https://github.com/GeoffChurch/shperl
@@ -67,6 +79,8 @@ private protocol and needs zero changes to shpool:
   create a name that already exists, and gates an attach to a session
   that's live in another terminal behind a force-confirm prompt.
 - **`shpool kill <name>`** — kill.
+- **`shpool var list` / `shpool var set <name> <value>`** — the `v`
+  variables view.
 
 shpool-table's own top-level flags (`--config-file`, `--log-file`,
 `--socket`, `-v`) are forwarded to every one of these calls, so e.g.
