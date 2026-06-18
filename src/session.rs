@@ -19,6 +19,24 @@ pub struct Session {
     /// `None` if the session has never been detached from since it
     /// was created (still on its first attach).
     pub last_disconnected_at_unix_ms: Option<u64>,
+    /// Live attach processes on this session, each carrying the
+    /// `session_name_template` it dialed in with. Only attached sessions
+    /// report any; a detached session reports an empty list. `default`
+    /// so list replies that omit the field (and the existing parse-test
+    /// fixtures) still deserialize. Drives the vars view's preview of
+    /// which attachments a template variable governs.
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
+}
+
+/// A single live attach process and the template it dialed in with. The
+/// resolved session name alone can't reveal which variable produced it;
+/// the template (`{workspace}-edit`) can.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct Attachment {
+    pub session_name_template: String,
+    /// shpool pids are positive; rendered verbatim in the preview.
+    pub pid: u64,
 }
 
 impl Session {
@@ -110,5 +128,46 @@ mod tests {
         }"#;
         let reply: ListReply = serde_json::from_str(json).unwrap();
         assert_eq!(reply.sessions.len(), 1);
+    }
+
+    #[test]
+    fn parse_attachments() {
+        // An attached session carries its attach procs' templates; a
+        // session that omits the field deserializes to an empty list
+        // (the `#[serde(default)]` path).
+        let json = r#"{
+            "sessions": [
+                {
+                    "name": "myproj-edit",
+                    "started_at_unix_ms": 0,
+                    "last_connected_at_unix_ms": 0,
+                    "last_disconnected_at_unix_ms": null,
+                    "status": "Attached",
+                    "attachments": [
+                        { "session_name_template": "{workspace}-edit", "pid": 111 },
+                        { "session_name_template": "{workspace}-edit", "pid": 222 }
+                    ]
+                },
+                {
+                    "name": "detached",
+                    "started_at_unix_ms": 0,
+                    "last_connected_at_unix_ms": 0,
+                    "last_disconnected_at_unix_ms": null,
+                    "status": "Disconnected"
+                }
+            ]
+        }"#;
+        let reply: ListReply = serde_json::from_str(json).unwrap();
+        assert_eq!(reply.sessions[0].attachments.len(), 2);
+        assert_eq!(
+            reply.sessions[0].attachments[0],
+            Attachment {
+                session_name_template: "{workspace}-edit".into(),
+                pid: 111,
+            }
+        );
+        assert_eq!(reply.sessions[0].attachments[1].pid, 222);
+        // Field omitted entirely -> empty via serde(default).
+        assert!(reply.sessions[1].attachments.is_empty());
     }
 }

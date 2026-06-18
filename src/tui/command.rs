@@ -29,6 +29,15 @@ pub enum Command {
     /// Kill the named session via `shpool kill`.
     Kill(String),
 
+    /// Fetch the daemon's template variables via `shpool var list`.
+    /// Result comes back as Event::VarsFetched or Event::VarsFetchFailed.
+    FetchVars,
+
+    /// Set a template variable via `shpool var set <name> <value>`, then
+    /// (on success) refetch the list. Result comes back as
+    /// Event::VarSetFinished.
+    SetVar { name: String, value: String },
+
     /// Stop the main loop.
     Quit,
 }

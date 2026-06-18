@@ -6,6 +6,28 @@ pub enum Mode {
     CreateInput(String),
     ConfirmKill(String),
     ConfirmForce(String),
+    /// The template-variable view. Carries its own scoped state so no
+    /// stale vars data lingers in the other modes.
+    Vars(VarsState),
+}
+
+/// One of the daemon's template variables.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Var {
+    pub name: String,
+    pub value: String,
+}
+
+/// State of the template-variable view: the snapshot of variables, the
+/// cursor into them, and the value-entry buffer. `edit` is `None` while
+/// browsing and `Some(buf)` while typing a new value. The governed-
+/// attachment preview is derived from `model.sessions` on demand, never
+/// stored here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VarsState {
+    pub vars: Vec<Var>,
+    pub selected: usize,
+    pub edit: Option<String>,
 }
 
 /// Where the cursor is, as a three-state value rather than a bare
@@ -208,6 +230,7 @@ mod tests {
             started_at_unix_ms: 0,
             last_connected_at_unix_ms: 0,
             last_disconnected_at_unix_ms: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -220,6 +243,7 @@ mod tests {
             started_at_unix_ms: touched,
             last_connected_at_unix_ms: touched,
             last_disconnected_at_unix_ms: None,
+            attachments: Vec::new(),
         }
     }
 

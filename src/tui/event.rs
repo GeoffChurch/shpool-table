@@ -3,6 +3,7 @@
 use crate::session::Session;
 
 use super::keymap::Key;
+use super::model::Var;
 
 #[derive(Debug)]
 pub enum Event {
@@ -45,5 +46,26 @@ pub enum Event {
         ok: bool,
         name: String,
         err: Option<String>,
+    },
+
+    /// `shpool var list` returned a fresh variable list. `update` opens
+    /// the vars view on it and emits no Command.
+    VarsFetched(Vec<Var>),
+
+    /// `shpool var list` failed. The string is a display-ready error;
+    /// `update` surfaces it in the footer and stays in Normal mode.
+    VarsFetchFailed(String),
+
+    /// A `shpool var set` shell-out finished. `ok` reflects exit status;
+    /// `err` carries the raw stderr if it failed; `vars` carries the
+    /// refetched list on success (or `None` if the refetch itself
+    /// failed — the old list is then kept silently). `update` clears the
+    /// edit line, applies the new list, and on success emits
+    /// Command::Refresh so the session preview reflects any re-dial.
+    VarSetFinished {
+        name: String,
+        ok: bool,
+        err: Option<String>,
+        vars: Option<Vec<Var>>,
     },
 }

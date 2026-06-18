@@ -52,6 +52,7 @@ pub enum NormalAction {
     NewSession,
     KillSelected,
     EnsureDaemon,
+    Variables,
     Quit,
 }
 
@@ -103,6 +104,12 @@ pub const NORMAL_BINDINGS: &[Binding] = &[
         action: NormalAction::EnsureDaemon,
     },
     Binding {
+        label: "v",
+        description: "vars",
+        keys: &[Key::Char(b'v')],
+        action: NormalAction::Variables,
+    },
+    Binding {
         label: "q",
         description: "quit",
         // Ctrl-C (0x03) is a global-quit convention. Enumerating it
@@ -118,6 +125,11 @@ pub const NORMAL_BINDINGS: &[Binding] = &[
 pub const CREATE_HINTS: &[(&str, &str)] = &[("ret", "create"), ("esc", "cancel")];
 pub const CONFIRM_KILL_HINTS: &[(&str, &str)] = &[("y", "confirm"), ("n", "cancel")];
 pub const CONFIRM_FORCE_HINTS: &[(&str, &str)] = &[("y", "force"), ("n", "cancel")];
+/// Footer hints for the vars view's browse state and its value-entry
+/// line. Byte handling lives in update.rs's `handle_key_vars`.
+pub const VARS_BROWSE_HINTS: &[(&str, &str)] =
+    &[("j/k", "select"), ("e", "set value"), ("esc", "back")];
+pub const VARS_EDIT_HINTS: &[(&str, &str)] = &[("ret", "apply"), ("esc", "cancel")];
 
 /// Look up which NormalAction (if any) a given Key triggers.
 /// Linear scan; the table is ~20 entries and this runs at most once

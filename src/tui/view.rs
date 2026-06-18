@@ -1,7 +1,13 @@
+use std::collections::HashMap;
 use std::io::{self, Write};
 
-use super::keymap::{CONFIRM_FORCE_HINTS, CONFIRM_KILL_HINTS, CREATE_HINTS, NORMAL_BINDINGS};
-use super::model::{Mode, Model};
+use super::keymap::{
+    CONFIRM_FORCE_HINTS, CONFIRM_KILL_HINTS, CREATE_HINTS, NORMAL_BINDINGS, VARS_BROWSE_HINTS,
+    VARS_EDIT_HINTS,
+};
+use super::model::{Mode, Model, VarsState};
+use super::template::{attachments_for_var, resolve_template};
+use crate::session::Session;
 
 // SGR codes for the bar chrome. The chrome reads as a phosphor-amber
 // CRT bezel: dark bar background with two-tone amber text on top.
@@ -291,6 +297,29 @@ pub fn render(
 
     out.write_all(b"\x1b[2J\x1b[H")?;
 
+    // Dispatch by screen. The modal modes share the session-table screen,
+    // differing only in the bottom bar; the vars view is its own screen
+    // (two-bar layout, no header row, no viewport). Enumerated rather than
+    // `_` so a new full-screen mode is forced to declare which screen it
+    // draws here.
+    match &model.mode {
+        Mode::Vars(vs) => render_vars(out, w, height as usize, vs, &model.sessions, &model.error),
+        Mode::Normal | Mode::CreateInput(_) | Mode::ConfirmKill(_) | Mode::ConfirmForce(_) => {
+            render_session_screen(model, w, height, now_ms, out)
+        }
+    }
+}
+
+/// The session-table screen: title bar, the session list (or empty
+/// notice), and the per-mode bottom bar. Shared by Normal and the modal
+/// modes (create / confirm), which differ only in that bottom bar.
+fn render_session_screen(
+    model: &Model,
+    w: usize,
+    height: u16,
+    now_ms: u64,
+    out: &mut impl Write,
+) -> io::Result<()> {
     render_bar(out, w, &title_label(model), BarAlign::Center)?;
 
     // Name column width grows to fit the longest session name, with a
@@ -365,6 +394,139 @@ pub fn render(
     Ok(())
 }
 
+/// Render the template-variable view: the variable list with a cursor,
+/// plus a live preview of which attachments the selected variable
+/// governs — and, while editing, what each would re-dial to under the
+/// typed value. Two chrome lines only (title bar + bottom bar); the body
+/// is top-clipped to `height - 2`, not scrolled into a viewport.
+fn render_vars(
+    out: &mut impl Write,
+    w: usize,
+    height: usize,
+    vs: &VarsState,
+    sessions: &[Session],
+    error: &Option<String>,
+) -> io::Result<()> {
+    render_bar(out, w, &vars_title_label(vs), BarAlign::Center)?;
+
+    // Each body line is (visible text, whether to reverse-video it).
+    let mut lines: Vec<(String, bool)> = Vec::new();
+    if vs.vars.is_empty() {
+        lines.push((
+            "  (no variables — shpool var set NAME VALUE)".to_string(),
+            false,
+        ));
+    } else {
+        // Name column grows to the widest variable name.
+        let nw = vs.vars.iter().map(|v| v.name.len()).max().unwrap_or(0);
+        for (i, v) in vs.vars.iter().enumerate() {
+            let is_selected = i == vs.selected;
+            let arrow = if is_selected { '>' } else { ' ' };
+            let count = attachments_for_var(sessions, &v.name).len();
+            let row = clip(
+                &format!(
+                    " {arrow} {name:<nw$} = {value}   ({count} session{plural})",
+                    name = v.name,
+                    value = v.value,
+                    plural = if count == 1 { "" } else { "s" },
+                ),
+                w,
+            );
+            lines.push((row, is_selected));
+        }
+
+        // Build the resolve map from the current values; while editing,
+        // override the selected variable with the in-progress buffer so
+        // each governed row shows its prospective re-dial target.
+        let mut vmap: HashMap<&str, &str> = vs
+            .vars
+            .iter()
+            .map(|v| (v.name.as_str(), v.value.as_str()))
+            .collect();
+        let sel = &vs.vars[vs.selected];
+        if let Some(buf) = &vs.edit {
+            vmap.insert(sel.name.as_str(), buf.as_str());
+        }
+
+        let hits = attachments_for_var(sessions, &sel.name);
+        lines.push((String::new(), false));
+        if hits.is_empty() {
+            lines.push((
+                "  (no attachments reference this variable)".to_string(),
+                false,
+            ));
+        } else {
+            lines.push((
+                format!(
+                    "  {name} governs {n} attachment{plural}:",
+                    name = sel.name,
+                    n = hits.len(),
+                    plural = if hits.len() == 1 { "" } else { "s" },
+                ),
+                false,
+            ));
+            for a in &hits {
+                let mut row = format!(
+                    "    {tmpl:<24} {sess:<16} pid {pid}",
+                    tmpl = a.template,
+                    sess = a.session,
+                    pid = a.pid,
+                );
+                if vs.edit.is_some() {
+                    let after = resolve_template(a.template, &vmap);
+                    if after != a.session {
+                        row.push_str(&format!("  -> {after}"));
+                    }
+                }
+                lines.push((clip(&row, w), false));
+            }
+        }
+    }
+
+    // Top-clip the body to the rows between the two bars.
+    let body_rows = height.saturating_sub(2);
+    for (text, selected) in lines.into_iter().take(body_rows) {
+        if selected {
+            write!(out, "{SGR_SELECTED}{text:<w$}{SGR_RESET}\r\n")?;
+        } else {
+            write!(out, "{text}\r\n")?;
+        }
+    }
+
+    render_bar(out, w, &vars_bottom_label(vs, error), BarAlign::Left)?;
+    Ok(())
+}
+
+fn vars_title_label(vs: &VarsState) -> Label {
+    let mut l = Label::default();
+    l.push_key(&format!("variables ({})", vs.vars.len()));
+    l
+}
+
+/// Vars-view bottom bar. The value-entry line outranks an error (same
+/// rule as the session view's modals); otherwise the key hints.
+fn vars_bottom_label(vs: &VarsState, error: &Option<String>) -> Label {
+    if let Some(buf) = &vs.edit {
+        let mut l = Label::default();
+        l.push_plain("set ");
+        if let Some(v) = vs.vars.get(vs.selected) {
+            l.push_key(&v.name);
+        }
+        l.push_plain(" = ");
+        l.push_key(buf);
+        l.push_plain("_   (");
+        push_hints(&mut l, VARS_EDIT_HINTS);
+        l.push_plain(")");
+        return l;
+    }
+    if let Some(err) = error {
+        return error_label(err);
+    }
+    let mut l = Label::default();
+    push_hints(&mut l, VARS_BROWSE_HINTS);
+    l
+}
+
 /// The bottom-bar contents, in priority order: an active modal prompt
 /// outranks a transient error, which outranks the idle key bindings.
 ///
@@ -379,6 +541,9 @@ fn bottom_bar_label(model: &Model) -> Label {
         Mode::CreateInput(input) => create_input_label(input),
         Mode::ConfirmKill(name) => confirm_kill_label(name),
         Mode::ConfirmForce(name) => confirm_force_label(name),
+        // The vars view renders its own bar in render_vars; this arm is
+        // here for exhaustiveness and routes to the same builder.
+        Mode::Vars(vs) => vars_bottom_label(vs, &model.error),
         Mode::Normal => match &model.error {
             Some(err) => error_label(err),
             None => normal_bindings_label(),
@@ -414,6 +579,7 @@ mod tests {
             started_at_unix_ms: last_active_ms,
             last_connected_at_unix_ms: last_active_ms,
             last_disconnected_at_unix_ms: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -459,11 +625,11 @@ mod tests {
 
     #[test]
     fn empty_list_shows_hint() {
-        // Width 72 fits the full Normal-mode footer including all
+        // Width 76 fits the full Normal-mode footer including all
         // keybindings. Narrower terminals clip the footer's tail but
         // the rest of the TUI still functions.
         let m = Model::new(vec![]);
-        insta::assert_snapshot!(render_visible(&m, 72, 6));
+        insta::assert_snapshot!(render_visible(&m, 76, 6));
     }
 
     #[test]
@@ -473,7 +639,7 @@ mod tests {
             sess("build", false, NOW_MS - 3 * 60 * 60 * 1000),
         ]);
         m.selection = Selection::At(1);
-        insta::assert_snapshot!(render_visible(&m, 70, 6));
+        insta::assert_snapshot!(render_visible(&m, 76, 6));
     }
 
     #[test]
@@ -600,5 +766,114 @@ mod tests {
     #[test]
     fn empty_list_never_ticks() {
         assert_eq!(next_render_delay_ms(&Model::new(vec![]), NOW_MS), None);
+    }
+
+    // -- vars view --
+
+    use crate::session::Attachment;
+    use crate::tui::model::{Var, VarsState};
+
+    fn attached_sess(name: &str, template: &str, pid: u64) -> Session {
+        Session {
+            name: name.to_string(),
+            attached: true,
+            started_at_unix_ms: NOW_MS,
+            last_connected_at_unix_ms: NOW_MS,
+            last_disconnected_at_unix_ms: None,
+            attachments: vec![Attachment {
+                session_name_template: template.to_string(),
+                pid,
+            }],
+        }
+    }
+
+    /// A model in the vars view: two variables, plus attached sessions
+    /// dialed in with `{workspace}-...` templates so the `workspace`
+    /// variable governs two attachments.
+    fn vars_view_model(selected: usize, edit: Option<&str>) -> Model {
+        let mut m = Model::new(vec![
+            attached_sess("myproj-edit", "{workspace}-edit", 111),
+            attached_sess("myproj-term", "{workspace}-term", 222),
+            attached_sess("vim-notes", "{editor}-notes", 333),
+        ]);
+        m.mode = Mode::Vars(VarsState {
+            vars: vec![
+                Var {
+                    name: "editor".into(),
+                    value: "vim".into(),
+                },
+                Var {
+                    name: "workspace".into(),
+                    value: "myproj".into(),
+                },
+            ],
+            selected,
+            edit: edit.map(|s| s.to_string()),
+        });
+        m
+    }
+
+    #[test]
+    fn vars_view_browsing() {
+        // Cursor on `workspace`, browsing: shows the variable list with
+        // governs-counts and the two governed attachments (no `->`,
+        // since we're not editing).
+        let m = vars_view_model(1, None);
+        insta::assert_snapshot!(render_visible(&m, 72, 10));
+    }
+
+    #[test]
+    fn vars_view_editing_shows_prospective_target() {
+        // Editing `workspace` to "newproj": the value-entry bar shows,
+        // and each governed attachment shows its prospective re-dial
+        // target via `->`.
+        let m = vars_view_model(1, Some("newproj"));
+        insta::assert_snapshot!(render_visible(&m, 72, 10));
+    }
+
+    #[test]
+    fn vars_view_empty() {
+        // No variables: the empty-state line (em dash) and the browse
+        // hints.
+        let mut m = Model::new(vec![]);
+        m.mode = Mode::Vars(VarsState {
+            vars: vec![],
+            selected: 0,
+            edit: None,
+        });
+        insta::assert_snapshot!(render_visible(&m, 72, 6));
+    }
+
+    #[test]
+    fn vars_edit_bar_outranks_error() {
+        // The value-entry bar outranks a parked error, matching the
+        // session view's modal-over-error rule.
+        let vs = VarsState {
+            vars: vec![Var {
+                name: "editor".into(),
+                value: "vim".into(),
+            }],
+            selected: 0,
+            edit: Some("nano".into()),
+        };
+        let err = Some("boom".to_string());
+        let label = strip_ansi(&vars_bottom_label(&vs, &err).styled);
+        assert!(label.contains("set editor = nano_"), "got: {label:?}");
+        assert!(!label.contains("boom"), "got: {label:?}");
+    }
+
+    #[test]
+    fn vars_error_shows_when_not_editing() {
+        let vs = VarsState {
+            vars: vec![Var {
+                name: "editor".into(),
+                value: "vim".into(),
+            }],
+            selected: 0,
+            edit: None,
+        };
+        let err = Some("var set editor: nope".to_string());
+        let label = strip_ansi(&vars_bottom_label(&vs, &err).styled);
+        assert!(label.contains("var set editor: nope"), "got: {label:?}");
     }
 }

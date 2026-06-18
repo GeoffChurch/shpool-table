@@ -11,7 +11,7 @@
 use super::command::Command;
 use super::event::Event;
 use super::keymap::{Key, NormalAction, normal_action};
-use super::model::{Mode, Model, Selection};
+use super::model::{Mode, Model, Selection, VarsState};
 
 /// Fold one event into the model. Returns `Some(Command)` if the
 /// event triggers a side effect (attach / kill / create / quit /
@@ -74,6 +74,52 @@ pub fn update(model: &mut Model, event: Event) -> Option<Command> {
             }
             Some(Command::Refresh)
         }
+        Event::VarsFetched(vars) => {
+            // Open the vars view on the fresh snapshot, cursor at the top.
+            model.mode = Mode::Vars(VarsState {
+                vars,
+                selected: 0,
+                edit: Option::None,
+            });
+            Option::None
+        }
+        Event::VarsFetchFailed(e) => {
+            // List failed: stay in Normal mode with the error parked,
+            // rather than opening an empty view.
+            model.set_error(format!("shpool var list: {e}"));
+            Option::None
+        }
+        Event::VarSetFinished {
+            name,
+            ok,
+            err,
+            vars,
+        } => {
+            // Clear the edit line regardless of outcome; on success
+            // swap in the refetched list (preserving the cursor by
+            // index, clamped if the list shrank).
+            if let Mode::Vars(vs) = &mut model.mode {
+                vs.edit = Option::None;
+                if ok {
+                    if let Some(v) = vars {
+                        vs.selected = vs.selected.min(v.len().saturating_sub(1));
+                        vs.vars = v;
+                    }
+                }
+            }
+            if ok {
+                // Refresh sessions so the preview reflects any re-dial
+                // the set triggered. Mirrors shperl's var_set branch.
+                Some(Command::Refresh)
+            } else {
+                let msg = match err {
+                    Some(e) => format!("var set {name}: {e}"),
+                    Option::None => format!("var set {name} failed"),
+                };
+                model.set_error(msg);
+                Option::None
+            }
+        }
     };
 
     // Auto-refresh: a Normal-mode keystroke that produced no Command of
@@ -130,6 +176,7 @@ fn handle_key(model: &mut Model, key: Key) -> Option<Command> {
         Mode::Normal => handle_key_normal(model, key),
         Mode::CreateInput(_) => handle_key_create(model, key),
         Mode::ConfirmKill(_) | Mode::ConfirmForce(_) => handle_key_confirm(model, key),
+        Mode::Vars(_) => handle_key_vars(model, key),
     }
 }
 
@@ -191,6 +238,7 @@ fn handle_key_normal(model: &mut Model, key: Key) -> Option<Command> {
             None
         }
         NormalAction::EnsureDaemon => Some(Command::EnsureDaemon),
+        NormalAction::Variables => Some(Command::FetchVars),
         NormalAction::Quit => Some(Command::Quit),
     }
 }
@@ -273,6 +321,92 @@ fn handle_key_confirm(model: &mut Model, key: Key) -> Option<Command> {
     }
 }
 
+/// Handle a key in the template-variable view. Two sub-states keyed off
+/// `edit`:
+///   browsing (`edit == None`) — j/k/arrows move the cursor (wrapping);
+///     e/Enter open the value line prefilled with the current value;
+///     Esc/q/Ctrl-C return to the session list. `Q` and everything else
+///     are ignored (matching shperl — `Q` is not a leave key here).
+///   editing (`edit == Some(buf)`) — printable bytes (incl. space)
+///     accumulate; Backspace pops; Enter commits a Command::SetVar; Esc/
+///     Ctrl-C cancel the edit (the variable stays selected). Arrows and
+///     other non-printables are ignored.
+fn handle_key_vars(model: &mut Model, key: Key) -> Option<Command> {
+    let Mode::Vars(vs) = &mut model.mode else {
+        return Option::None;
+    };
+
+    // Editing sub-state.
+    if let Some(buf) = &mut vs.edit {
+        match key {
+            Key::Esc | Key::Ctrl(0x03) => {
+                vs.edit = Option::None;
+                Option::None
+            }
+            Key::Enter => {
+                // Commit: move the buffer out as the value; the name is
+                // the selected variable. The edit sub-state is cleared
+                // when VarSetFinished lands.
+                let value = std::mem::take(buf);
+                vs.vars.get(vs.selected).map(|v| Command::SetVar {
+                    name: v.name.clone(),
+                    value,
+                })
+            }
+            Key::Backspace => {
+                buf.pop();
+                Option::None
+            }
+            // Values may hold spaces (e.g. nothing rejects them here),
+            // so space is accepted unlike in the create-name prompt.
+            Key::Char(b) => {
+                buf.push(b as char);
+                Option::None
+            }
+            // Arrows and other non-printables: ignored.
+            _ => Option::None,
+        }
+    } else {
+        // Browsing sub-state. Leave keys transition out — compute first,
+        // then reassign model.mode (can't hold &mut into vs across it).
+        match key {
+            Key::Down | Key::Char(b'j') | Key::Char(b'J') => {
+                vars_select(vs, 1);
+                Option::None
+            }
+            Key::Up | Key::Char(b'k') | Key::Char(b'K') => {
+                vars_select(vs, -1);
+                Option::None
+            }
+            Key::Enter | Key::Char(b'e') => {
+                // Open the value line, prefilled with the current value.
+                // No-op on an empty list (no variable to edit).
+                if let Some(v) = vs.vars.get(vs.selected) {
+                    vs.edit = Some(v.value.clone());
+                }
+                Option::None
+            }
+            Key::Esc | Key::Char(b'q') | Key::Ctrl(0x03) => {
+                model.mode = Mode::Normal;
+                Option::None
+            }
+            // Everything else (incl. `Q`): ignored — stay in the view.
+            _ => Option::None,
+        }
+    }
+}
+
+/// Move the vars cursor by `dir`, wrapping at both ends. No-op on an
+/// empty list.
+fn vars_select(vs: &mut VarsState, dir: isize) {
+    let n = vs.vars.len();
+    if n == 0 {
+        return;
+    }
+    let next = (vs.selected as isize + dir).rem_euclid(n as isize) as usize;
+    vs.selected = next;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,6 +419,7 @@ mod tests {
             started_at_unix_ms: 0,
             last_connected_at_unix_ms: 0,
             last_disconnected_at_unix_ms: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -816,5 +951,256 @@ mod tests {
         assert_eq!(cmd, Some(Command::Refresh));
         assert!(!m.is_stale());
         assert!(m.error.is_none());
+    }
+
+    // -- vars view state machine --
+
+    use super::super::model::Var;
+
+    fn var(name: &str, value: &str) -> Var {
+        Var {
+            name: name.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    /// A model parked in the vars view with two variables, cursor at 0.
+    /// Mirrors shperl's make_vars_model fixture.
+    fn vars_model() -> Model {
+        let mut m = Model::new(vec![]);
+        m.mode = Mode::Vars(VarsState {
+            vars: vec![var("editor", "vim"), var("workspace", "myproj")],
+            selected: 0,
+            edit: Option::None,
+        });
+        m
+    }
+
+    /// Destructure the vars state, panicking if the model isn't in the
+    /// vars view — keeps the tests asserting on fields, not on whole-Vec
+    /// equality.
+    fn vars(m: &Model) -> &VarsState {
+        let Mode::Vars(vs) = &m.mode else {
+            panic!("expected Mode::Vars, got {:?}", m.mode);
+        };
+        vs
+    }
+
+    #[test]
+    fn v_in_normal_mode_fetches_vars() {
+        let mut m = Model::new(vec![mk("a")]);
+        assert_eq!(
+            update(&mut m, key(Key::Char(b'v'))),
+            Some(Command::FetchVars)
+        );
+        // Still Normal until the fetched event arrives.
+        assert_eq!(m.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn vars_fetched_opens_view() {
+        let mut m = Model::new(vec![mk("a")]);
+        let cmd = update(
+            &mut m,
+            Event::VarsFetched(vec![var("editor", "vim"), var("workspace", "myproj")]),
+        );
+        assert_eq!(cmd, None);
+        let vs = vars(&m);
+        assert_eq!(vs.vars.len(), 2);
+        assert_eq!(vs.selected, 0);
+        assert_eq!(vs.edit, None);
+    }
+
+    #[test]
+    fn vars_fetch_failed_stays_normal_with_error() {
+        let mut m = Model::new(vec![mk("a")]);
+        let cmd = update(&mut m, Event::VarsFetchFailed("boom".into()));
+        assert_eq!(cmd, None);
+        assert_eq!(m.mode, Mode::Normal);
+        assert!(m.error.as_deref().unwrap_or("").contains("shpool var list"));
+    }
+
+    #[test]
+    fn vars_browse_jk_move_and_wrap() {
+        // Ports shperl's "vars browse: j/k move the cursor and wrap".
+        let mut m = vars_model();
+        update(&mut m, key(Key::Char(b'j')));
+        assert_eq!(vars(&m).selected, 1, "j moves down");
+        update(&mut m, key(Key::Char(b'j')));
+        assert_eq!(vars(&m).selected, 0, "j wraps to top");
+        update(&mut m, key(Key::Char(b'k')));
+        assert_eq!(vars(&m).selected, 1, "k wraps to bottom");
+    }
+
+    #[test]
+    fn vars_edit_e_prefills_then_enter_commits() {
+        // Ports "vars edit: e opens the value line prefilled; chars +
+        // Enter commit". Asserts the emitted Command::SetVar, not a
+        // shell-out.
+        let mut m = vars_model(); // selected 0 = editor=vim
+        update(&mut m, key(Key::Char(b'e')));
+        assert_eq!(vars(&m).edit.as_deref(), Some("vim"), "prefilled");
+        // Backspace x3 -> empty.
+        update(&mut m, key(Key::Backspace));
+        update(&mut m, key(Key::Backspace));
+        update(&mut m, key(Key::Backspace));
+        assert_eq!(vars(&m).edit.as_deref(), Some(""), "backspaced empty");
+        // Type "nano".
+        for b in b"nano" {
+            update(&mut m, key(Key::Char(*b)));
+        }
+        assert_eq!(vars(&m).edit.as_deref(), Some("nano"));
+        let cmd = update(&mut m, key(Key::Enter));
+        assert_eq!(
+            cmd,
+            Some(Command::SetVar {
+                name: "editor".into(),
+                value: "nano".into(),
+            }),
+        );
+    }
+
+    #[test]
+    fn vars_edit_accepts_spaces_in_value() {
+        // Values may hold spaces (unlike session names) — the create
+        // prompt drops them, the vars edit line keeps them.
+        let mut m = vars_model();
+        update(&mut m, key(Key::Char(b'e')));
+        // Clear the prefill, then type "key bugfix".
+        for _ in 0..3 {
+            update(&mut m, key(Key::Backspace));
+        }
+        for b in b"key bugfix" {
+            update(&mut m, key(Key::Char(*b)));
+        }
+        assert_eq!(vars(&m).edit.as_deref(), Some("key bugfix"));
+    }
+
+    #[test]
+    fn vars_edit_esc_cancels_but_stays_in_view() {
+        // Ports "vars edit: Esc cancels the edit but stays in the view".
+        let mut m = vars_model();
+        update(&mut m, key(Key::Char(b'e')));
+        update(&mut m, key(Key::Char(b'x')));
+        assert_eq!(vars(&m).edit.as_deref(), Some("vimx"));
+        update(&mut m, key(Key::Esc));
+        assert_eq!(vars(&m).edit, None, "edit cancelled");
+        assert!(matches!(m.mode, Mode::Vars(_)), "still in the vars view");
+    }
+
+    #[test]
+    fn vars_browse_esc_and_q_both_leave() {
+        // Ports "vars browse: Esc and q both leave the view".
+        let mut m = vars_model();
+        update(&mut m, key(Key::Esc));
+        assert_eq!(m.mode, Mode::Normal, "Esc returns to the session list");
+        let mut m2 = vars_model();
+        update(&mut m2, key(Key::Char(b'q')));
+        assert_eq!(m2.mode, Mode::Normal, "q returns to the session list");
+    }
+
+    #[test]
+    fn vars_browse_uppercase_q_does_not_leave() {
+        // `Q` is not a leave key in the vars view (matches shperl) —
+        // it's ignored, and the view stays up.
+        let mut m = vars_model();
+        update(&mut m, key(Key::Char(b'Q')));
+        assert!(matches!(m.mode, Mode::Vars(_)));
+    }
+
+    #[test]
+    fn vars_set_finished_ok_applies_list_and_refreshes() {
+        // On success the edit line clears, the refetched list is applied
+        // (cursor preserved), and a Refresh is emitted to re-dial the
+        // preview.
+        let mut m = vars_model();
+        update(&mut m, key(Key::Char(b'e'))); // open edit on editor
+        let cmd = update(
+            &mut m,
+            Event::VarSetFinished {
+                name: "editor".into(),
+                ok: true,
+                err: Option::None,
+                vars: Some(vec![var("editor", "nano"), var("workspace", "myproj")]),
+            },
+        );
+        assert_eq!(cmd, Some(Command::Refresh));
+        let vs = vars(&m);
+        assert_eq!(vs.edit, None, "edit line cleared");
+        assert_eq!(vs.vars[0].value, "nano", "new list applied");
+        assert_eq!(vs.selected, 0, "cursor preserved");
+    }
+
+    #[test]
+    fn vars_set_finished_ok_with_no_refetch_keeps_old_list() {
+        // A successful set whose refetch failed (vars: None) keeps the
+        // prior list silently — still refreshes sessions.
+        let mut m = vars_model();
+        let cmd = update(
+            &mut m,
+            Event::VarSetFinished {
+                name: "editor".into(),
+                ok: true,
+                err: Option::None,
+                vars: Option::None,
+            },
+        );
+        assert_eq!(cmd, Some(Command::Refresh));
+        let vs = vars(&m);
+        assert_eq!(vs.vars[0].value, "vim", "old list kept");
+    }
+
+    #[test]
+    fn vars_set_finished_fail_sets_error_no_refresh() {
+        let mut m = vars_model();
+        let cmd = update(
+            &mut m,
+            Event::VarSetFinished {
+                name: "editor".into(),
+                ok: false,
+                err: Some("not allowed".into()),
+                vars: Option::None,
+            },
+        );
+        assert_eq!(cmd, None, "no refresh on failure");
+        assert_eq!(m.error.as_deref(), Some("var set editor: not allowed"));
+        // Edit line still cleared; still in the view.
+        assert_eq!(vars(&m).edit, None);
+    }
+
+    #[test]
+    fn vars_set_finished_fail_without_stderr_uses_generic() {
+        let mut m = vars_model();
+        update(
+            &mut m,
+            Event::VarSetFinished {
+                name: "editor".into(),
+                ok: false,
+                err: Option::None,
+                vars: Option::None,
+            },
+        );
+        assert_eq!(m.error.as_deref(), Some("var set editor failed"));
+    }
+
+    #[test]
+    fn vars_keystroke_does_not_auto_refresh() {
+        // The auto-refresh fallback is gated on Mode::Normal, so a
+        // browse keystroke in the vars view never storms shpool with
+        // list calls.
+        let mut m = vars_model();
+        assert_eq!(update(&mut m, key(Key::Char(b'j'))), None);
+    }
+
+    #[test]
+    fn vars_e_on_empty_list_is_noop() {
+        let mut m = Model::new(vec![]);
+        m.mode = Mode::Vars(VarsState {
+            vars: vec![],
+            selected: 0,
+            edit: Option::None,
+        });
+        assert_eq!(update(&mut m, key(Key::Char(b'e'))), None);
+        assert_eq!(vars(&m).edit, None, "no edit opened on empty list");
     }
 }

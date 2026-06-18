@@ -1,0 +1,7 @@
+---
+source: src/tui/view.rs
+expression: "render_visible(&m, 72, 6)"
+---
+                             variables (0)                              
+  (no variables — shpool var set NAME VALUE)
+  j/k: select, e: set value, esc: back

@@ -11,7 +11,7 @@ use clap::Parser;
 
 use crate::events::{Drain, EventsSub};
 use crate::session::{ListReply, Session};
-use crate::tui::{Command, Event, Input, InputParser, Model};
+use crate::tui::{Command, Event, Input, InputParser, Model, Var};
 
 /// Top-level flags. `apply` re-emits the four below — in a fixed order,
 /// ahead of the subcommand — onto every `shpool` shell-out (list, kill,
@@ -107,6 +107,66 @@ fn list_sessions(mut cmd: process::Command) -> Result<Vec<Session>> {
     let reply: ListReply =
         serde_json::from_slice(&out.stdout).context("parsing shpool list JSON")?;
     Ok(reply.sessions)
+}
+
+/// Fetch the daemon's template variables via `shpool var list`, which
+/// emits one `name<TAB>value` line each (TSV, not JSON). Returns them
+/// sorted by name, with the global flags applied exactly as
+/// `fetch_sessions` does. Spawn/exit failure becomes an error.
+fn list_vars(flags: &Flags) -> Result<Vec<Var>> {
+    let mut cmd = process::Command::new("shpool");
+    flags.apply(&mut cmd);
+    let out = cmd
+        .args(["var", "list"])
+        .output()
+        .context("running `shpool var list`")?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!("`shpool var list` failed: {}", stderr.trim());
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut vars: Vec<Var> = stdout
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            // Split on the first tab; a value-less line yields an empty
+            // value, matching shperl's `split /\t/, $line, 2`.
+            let (name, value) = line.split_once('\t').unwrap_or((line, ""));
+            Var {
+                name: name.to_string(),
+                value: value.to_string(),
+            }
+        })
+        .collect();
+    vars.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(vars)
+}
+
+/// Run `shpool var set <name> <value>` and collect its outcome + raw
+/// stderr. Returns `(ok, raw_trimmed_stderr)`. Unlike `shell_kill`, the
+/// stderr is returned verbatim (no `"var set ..."` prefix) — that prefix
+/// is applied once, in update's VarSetFinished handler. Shell-out
+/// failures (couldn't even spawn shpool) propagate.
+fn set_var(name: &str, value: &str, flags: &Flags) -> Result<(bool, Option<String>)> {
+    let mut cmd = process::Command::new("shpool");
+    flags.apply(&mut cmd);
+    let output = cmd
+        .args(["var", "set", name, value])
+        .output()
+        .context("running `shpool var set`")?;
+    let ok = output.status.success();
+    let err = if ok {
+        None
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        if detail.is_empty() {
+            None
+        } else {
+            Some(detail.to_string())
+        }
+    };
+    Ok((ok, err))
 }
 
 fn main() -> Result<()> {
@@ -411,6 +471,26 @@ fn execute<W: Write>(
         Command::Kill(name) => {
             let (ok, err) = shell_kill(&name, flags)?;
             Ok(Some(Event::KillFinished { ok, name, err }))
+        }
+        Command::FetchVars => {
+            let ev = match list_vars(flags) {
+                Ok(vars) => Event::VarsFetched(vars),
+                Err(e) => Event::VarsFetchFailed(format!("{e}")),
+            };
+            Ok(Some(ev))
+        }
+        Command::SetVar { name, value } => {
+            let (ok, err) = set_var(&name, &value, flags)?;
+            // On success, refetch the list so the view reflects the new
+            // value. `.ok()` keeps the old list silently if the refetch
+            // itself fails (update leaves VarsState.vars untouched).
+            let vars = if ok { list_vars(flags).ok() } else { None };
+            Ok(Some(Event::VarSetFinished {
+                name,
+                ok,
+                err,
+                vars,
+            }))
         }
     }
 }
