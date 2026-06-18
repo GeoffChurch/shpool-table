@@ -182,10 +182,7 @@ impl Model {
         // Capture the prior selection's identity before swapping the
         // list out from under the index it points into.
         let prev_name = self.selected_name().map(str::to_string);
-        let stale_name = match &self.selection {
-            Selection::Stale(n) => Some(n.clone()),
-            _ => Option::None,
-        };
+        let was_stale = matches!(self.selection, Selection::Stale(_));
         self.sessions = new_sessions;
 
         // Had a valid selection: re-seat by name, or go Stale.
@@ -200,12 +197,12 @@ impl Model {
             return;
         }
 
-        // Already stale: keep waiting for the ack, unless the session
-        // came back (recreated same-named) — then re-seat on it.
-        if let Some(name) = stale_name {
-            if let Some(i) = self.sessions.iter().position(|s| s.name == name) {
-                self.selection = Selection::At(i);
-            }
+        // Already stale: stay stale until the user acks, even if a
+        // same-named session reappears. A reappearance is a recreated,
+        // different instance; silently adopting it would hide that the
+        // original is gone — and could land an attach/kill on the new
+        // session while the user believes it's the original.
+        if was_stale {
             return;
         }
 
@@ -313,11 +310,15 @@ mod tests {
     }
 
     #[test]
-    fn refresh_stale_clears_when_session_reappears() {
+    fn refresh_stale_persists_when_same_named_session_reappears() {
+        // A reappeared same-named session is a recreated, different
+        // instance — stay stale so the user is told the original is gone
+        // rather than silently adopting the new one.
         let mut m = Model::new(vec![mk("a")]);
         m.selection = Selection::Stale("b".into());
         m.refresh(vec![mk("a"), mk("b")]);
-        assert_eq!(m.selected_name(), Some("b"));
+        assert_eq!(m.selection, Selection::Stale("b".into()));
+        assert_eq!(m.selected_name(), None);
     }
 
     #[test]
