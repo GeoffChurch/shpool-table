@@ -456,15 +456,7 @@ fn render_vars(
                 false,
             ));
         } else {
-            lines.push((
-                format!(
-                    "  {name} governs {n} attachment{plural}:",
-                    name = sel.name,
-                    n = hits.len(),
-                    plural = if hits.len() == 1 { "" } else { "s" },
-                ),
-                false,
-            ));
+            lines.push((format!("  {{{name}}} attachments:", name = sel.name), false));
             for a in &hits {
                 let mut row = format!(
                     "    {tmpl:<24} {sess:<16} pid {pid}",
