@@ -142,16 +142,43 @@ fn list_vars(flags: &Flags) -> Result<Vec<Var>> {
     Ok(vars)
 }
 
+/// shpool command builders. Each inserts `--` before the
+/// user-controlled positionals so a session name or value that begins
+/// with a dash (e.g. "-sh") isn't parsed as a flag by shpool's argument
+/// parser. Names are `\w+`, but variable values are unconstrained, so
+/// var-set needs the guard too.
+fn attach_cmd(name: &str, force: bool, flags: &Flags) -> process::Command {
+    let mut cmd = process::Command::new("shpool");
+    flags.apply(&mut cmd);
+    cmd.arg("attach");
+    if force {
+        cmd.arg("-f");
+    }
+    cmd.args(["--", name]);
+    cmd
+}
+
+fn kill_cmd(name: &str, flags: &Flags) -> process::Command {
+    let mut cmd = process::Command::new("shpool");
+    flags.apply(&mut cmd);
+    cmd.args(["kill", "--", name]);
+    cmd
+}
+
+fn var_set_cmd(name: &str, value: &str, flags: &Flags) -> process::Command {
+    let mut cmd = process::Command::new("shpool");
+    flags.apply(&mut cmd);
+    cmd.args(["var", "set", "--", name, value]);
+    cmd
+}
+
 /// Run `shpool var set <name> <value>` and collect its outcome + raw
 /// stderr. Returns `(ok, raw_trimmed_stderr)`. Unlike `shell_kill`, the
 /// stderr is returned verbatim (no `"var set ..."` prefix) — that prefix
 /// is applied once, in update's VarSetFinished handler. Shell-out
 /// failures (couldn't even spawn shpool) propagate.
 fn set_var(name: &str, value: &str, flags: &Flags) -> Result<(bool, Option<String>)> {
-    let mut cmd = process::Command::new("shpool");
-    flags.apply(&mut cmd);
-    let output = cmd
-        .args(["var", "set", name, value])
+    let output = var_set_cmd(name, value, flags)
         .output()
         .context("running `shpool var set`")?;
     let ok = output.status.success();
@@ -541,14 +568,9 @@ fn preflight_attach(name: &str, force: bool, flags: &Flags) -> Preflight {
 /// The caller (`with_tui_suspended`) is responsible for putting the
 /// terminal into cooked mode + primary screen first.
 fn shell_attach(name: &str, force: bool, flags: &Flags) -> Result<bool> {
-    let mut cmd = process::Command::new("shpool");
-    flags.apply(&mut cmd);
-    cmd.arg("attach");
-    if force {
-        cmd.arg("-f");
-    }
-    cmd.arg(name);
-    let status = cmd.status().context("spawning `shpool attach`")?;
+    let status = attach_cmd(name, force, flags)
+        .status()
+        .context("spawning `shpool attach`")?;
     Ok(status.success())
 }
 
@@ -557,10 +579,7 @@ fn shell_attach(name: &str, force: bool, flags: &Flags) -> Result<bool> {
 /// shpool) propagate; non-zero exit with a stderr payload comes back
 /// as `ok=false` + `err=Some(detail)`.
 fn shell_kill(name: &str, flags: &Flags) -> Result<(bool, Option<String>)> {
-    let mut cmd = process::Command::new("shpool");
-    flags.apply(&mut cmd);
-    let output = cmd
-        .args(["kill", name])
+    let output = kill_cmd(name, flags)
         .output()
         .context("running `shpool kill`")?;
     let ok = output.status.success();
@@ -627,6 +646,34 @@ mod tests {
         cmd.get_args()
             .map(|s| s.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn attach_cmd_guards_dash_led_name() {
+        let flags = Flags::default();
+        assert_eq!(
+            args_of(&attach_cmd("-sh", false, &flags)),
+            ["attach", "--", "-sh"]
+        );
+        assert_eq!(
+            args_of(&attach_cmd("-sh", true, &flags)),
+            ["attach", "-f", "--", "-sh"]
+        );
+    }
+
+    #[test]
+    fn kill_cmd_guards_dash_led_name() {
+        let flags = Flags::default();
+        assert_eq!(args_of(&kill_cmd("-sh", &flags)), ["kill", "--", "-sh"]);
+    }
+
+    #[test]
+    fn var_set_cmd_guards_dash_led_value() {
+        let flags = Flags::default();
+        assert_eq!(
+            args_of(&var_set_cmd("coin", "-xmr", &flags)),
+            ["var", "set", "--", "coin", "-xmr"]
+        );
     }
 
     #[test]
