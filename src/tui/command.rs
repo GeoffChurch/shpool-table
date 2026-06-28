@@ -24,7 +24,24 @@ pub enum Command {
     /// Spawn `shpool attach <new-name>`, which create-or-attaches on
     /// the daemon side. Distinct from Attach so the executor can skip
     /// the "session must already exist" pre-flight check.
+    ///
+    /// Detect step for the create-time variable prompt: the executor
+    /// runs `var list` + `unknown_template_vars` at the top, *before*
+    /// tearing down the alt-screen. Unknowns come back as
+    /// Event::CreateNeedsVars (no teardown, stays in alt-screen); none
+    /// falls through to teardown -> attach.
     Create(String),
+
+    /// Apply step for the create-time variable prompt: set each
+    /// collected `(name, value)` pair via `shpool var set` in order,
+    /// then teardown -> attach exactly like Create. A set failure aborts
+    /// (no attach) and comes back as Event::CreateVarsFailed. Partial
+    /// sets linger (no rollback). The loop runs in the executor, not via
+    /// VarSetFinished.
+    CreateWithVars {
+        name: String,
+        set_vars: Vec<(String, String)>,
+    },
 
     /// Kill the named session via `shpool kill`.
     Kill(String),

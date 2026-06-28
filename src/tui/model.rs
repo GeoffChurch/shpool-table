@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+
+use super::template::template_vars;
 use crate::session::Session;
 
 #[derive(Debug, PartialEq)]
@@ -6,28 +9,139 @@ pub enum Mode {
     CreateInput(String),
     ConfirmKill(String),
     ConfirmForce(String),
+    /// The create-time variable prompt: a new session whose name
+    /// references vars not yet set walks each unknown var (in
+    /// `template_vars` order), collecting a value, then sets the
+    /// non-empty ones and attaches. A bottom-bar mode like CreateInput —
+    /// the session list still renders behind it.
+    CreateVarPrompt(VarPromptState),
     /// The template-variable view. Carries its own scoped state so no
     /// stale vars data lingers in the other modes.
     Vars(VarsState),
 }
 
-/// One of the daemon's template variables.
+/// Per-var prompt state for a new session whose name references vars not
+/// yet set. `vars` is the ordered unknowns to walk; `idx` is the current
+/// one; `input` is the value typed so far; `collected` accumulates the
+/// non-empty `(var, value)` pairs to apply; `set_vars` is the snapshot of
+/// already-set vars from the detect-time `var list`, kept only to feed the
+/// live name preview (future-unknown vars are deliberately omitted from
+/// the preview map so they render literal).
 #[derive(Debug, Clone, PartialEq)]
+pub struct VarPromptState {
+    pub name: String,
+    pub vars: Vec<String>,
+    pub idx: usize,
+    pub input: String,
+    pub collected: Vec<(String, String)>,
+    pub set_vars: Vec<(String, String)>,
+}
+
+/// One of the daemon's template variables. `unset` flags a synthetic
+/// row — a variable an attached template references but `var list`
+/// doesn't carry — surfaced by the vars view as a dimmed `(unset)` row.
+/// Real (set) rows have `unset: false`, including a legitimately set
+/// but empty-valued var: emptiness is never inferred as unset.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Var {
     pub name: String,
     pub value: String,
+    pub unset: bool,
+}
+
+/// The `name -> value` map fed to `resolve_template` / `candidate_values`.
+/// Built from real (`!unset`) rows only: a synthetic unset row carries no
+/// value, and slipping an `editor -> ""` in here would collapse a literal
+/// `{editor}` in a preview to empty. The single source of that map, used
+/// wherever the vars view resolves a template.
+pub fn resolution_map(vars: &[Var]) -> HashMap<&str, &str> {
+    vars.iter()
+        .filter(|v| !v.unset)
+        .map(|v| (v.name.as_str(), v.value.as_str()))
+        .collect()
+}
+
+/// Surface variables a template references but `var list` doesn't carry:
+/// union the template vars across every attachment of every session, drop
+/// the ones already in `var_list`, and append a synthetic
+/// `Var { unset: true }` row for each remainder. The result is re-sorted
+/// by name so set and unset rows interleave alphabetically, matching the
+/// list view's ordering.
+///
+/// Templates live only on attached sessions (`attachments`), so a var
+/// referenced solely by a detached session contributes nothing — same
+/// scope as `attachments_for_var`. A var that is both set and referenced
+/// stays a single (set) row; a var referenced by several templates yields
+/// one unset row.
+pub fn merge_unset_vars(var_list: &[Var], sessions: &[Session]) -> Vec<Var> {
+    let set: std::collections::HashSet<&str> = var_list.iter().map(|v| v.name.as_str()).collect();
+    let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for s in sessions {
+        for a in &s.attachments {
+            for name in template_vars(&a.session_name_template) {
+                referenced.insert(name);
+            }
+        }
+    }
+    let mut merged = var_list.to_vec();
+    for name in referenced {
+        if !set.contains(name.as_str()) {
+            merged.push(Var {
+                name,
+                value: String::new(),
+                unset: true,
+            });
+        }
+    }
+    merged.sort_by(|a, b| a.name.cmp(&b.name));
+    merged
+}
+
+/// Re-derive the displayed variable list — set rows ∪ the unset rows the
+/// current sessions reference — preserving the cursor on the same variable
+/// by name. The list is a function of (real vars, sessions), so anything
+/// that changes either input while in the view (a `var set`, a session
+/// refresh) runs through here. The cursor moves by name because the merge
+/// re-sorts and a set can both add and remove rows (promoting an unset row
+/// to a set one, shifting indices); on no match (only a concurrent external
+/// `var unset` can drop the selected name) it clamps to the last row. Prior
+/// synthetic rows are filtered out first so they never feed back into the
+/// union as if they were set.
+pub fn remerge_preserving_cursor(vs: &mut VarsState, sessions: &[Session]) {
+    let prev_name = vs.vars.get(vs.selected).map(|v| v.name.clone());
+    let real: Vec<Var> = vs.vars.iter().filter(|v| !v.unset).cloned().collect();
+    vs.vars = merge_unset_vars(&real, sessions);
+    vs.selected = prev_name
+        .and_then(|name| vs.vars.iter().position(|v| v.name == name))
+        .unwrap_or_else(|| vs.vars.len().saturating_sub(1));
 }
 
 /// State of the template-variable view: the snapshot of variables, the
-/// cursor into them, and the value-entry buffer. `edit` is `None` while
-/// browsing and `Some(buf)` while typing a new value. The governed-
-/// attachment preview is derived from `model.sessions` on demand, never
-/// stored here.
+/// cursor into them, and the value selector. `edit` is `None` while
+/// browsing and `Some(EditState)` while picking/typing a value. The
+/// governed-attachment preview is derived from `model.sessions` on
+/// demand, never stored here.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VarsState {
     pub vars: Vec<Var>,
     pub selected: usize,
-    pub edit: Option<String>,
+    pub edit: Option<EditState>,
+}
+
+/// The value selector's two-slot state, held while editing a variable.
+/// `field` is the text Enter applies; `filter` is `field` as of the last
+/// typing keystroke (frozen while arrowing) and is what `candidates`
+/// filters by; `highlight` indexes the filtered (shown) list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EditState {
+    /// Editable text — the value Enter applies. Starts empty.
+    pub field: String,
+    /// The list filter: `field` as of the last typing keystroke.
+    pub filter: String,
+    /// All harvested candidate values, fixed for the duration of the edit.
+    pub candidates: Vec<String>,
+    /// Index into the filtered (shown) list.
+    pub highlight: usize,
 }
 
 /// Where the cursor is, as a three-state value rather than a bare
@@ -372,5 +486,256 @@ mod tests {
         assert_eq!(m.selection, Selection::None);
         m.refresh(vec![mk("a")]);
         assert_eq!(m.selected_name(), Some("a"));
+    }
+
+    // -- Feature A: union of unset rows --
+
+    use crate::session::Attachment;
+
+    /// A session whose single attachment carries `tmpl`. Bare-bones: the
+    /// unset derivation only reads `attachments[].session_name_template`.
+    fn tmpl_session(name: &str, tmpl: &str) -> Session {
+        Session {
+            name: name.to_string(),
+            attached: true,
+            started_at_unix_ms: 0,
+            last_connected_at_unix_ms: 0,
+            last_disconnected_at_unix_ms: None,
+            attachments: vec![Attachment {
+                session_name_template: tmpl.to_string(),
+                pid: 1,
+            }],
+        }
+    }
+
+    /// A detached session: exists by name but carries no attachments, so
+    /// its (notional) template is invisible to the unset derivation.
+    fn detached_session(name: &str) -> Session {
+        mk(name)
+    }
+
+    /// Reconstruct a session list (Session isn't Clone, but Attachment is)
+    /// so a test can both seed a model and keep a copy to re-merge against.
+    fn clone_sessions(sessions: &[Session]) -> Vec<Session> {
+        sessions
+            .iter()
+            .map(|s| Session {
+                name: s.name.clone(),
+                attached: s.attached,
+                started_at_unix_ms: s.started_at_unix_ms,
+                last_connected_at_unix_ms: s.last_connected_at_unix_ms,
+                last_disconnected_at_unix_ms: s.last_disconnected_at_unix_ms,
+                attachments: s.attachments.clone(),
+            })
+            .collect()
+    }
+
+    fn set_var(name: &str, value: &str) -> Var {
+        Var {
+            name: name.to_string(),
+            value: value.to_string(),
+            unset: false,
+        }
+    }
+
+    /// Flatten a merged list to `name=value` / `name(unset)` tokens, in
+    /// list order, for compact structural assertions (mirrors shperl's
+    /// `merged_repr`).
+    fn merged_repr(vars: &[Var]) -> Vec<String> {
+        vars.iter()
+            .map(|v| {
+                if v.unset {
+                    format!("{}(unset)", v.name)
+                } else {
+                    format!("{}={}", v.name, v.value)
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn merge_unset_vars_referenced_but_absent_become_unset_rows_sorted() {
+        let sessions = vec![
+            tmpl_session("A-x", "{a}-x"),
+            tmpl_session("B-x", "{b}-x"),
+            tmpl_session("C-x", "{c}-x"),
+        ];
+        let merged = merge_unset_vars(&[set_var("a", "1")], &sessions);
+        assert_eq!(merged_repr(&merged), ["a=1", "b(unset)", "c(unset)"]);
+    }
+
+    #[test]
+    fn merge_unset_vars_set_and_referenced_stays_a_single_set_row() {
+        let sessions = vec![tmpl_session("1-x", "{a}-x")];
+        let merged = merge_unset_vars(&[set_var("a", "1")], &sessions);
+        assert_eq!(merged_repr(&merged), ["a=1"]);
+    }
+
+    #[test]
+    fn merge_unset_vars_var_referenced_by_several_templates_yields_one_row() {
+        let sessions = vec![
+            tmpl_session("w-edit", "{w}-edit"),
+            tmpl_session("w-term", "{w}-term"),
+            tmpl_session("w-logs", "{w}-logs"),
+        ];
+        let merged = merge_unset_vars(&[], &sessions);
+        assert_eq!(merged_repr(&merged), ["w(unset)"]);
+    }
+
+    #[test]
+    fn merge_unset_vars_repeated_token_within_one_template_dedups() {
+        let sessions = vec![tmpl_session("a-a", "{a}-{a}")];
+        let merged = merge_unset_vars(&[], &sessions);
+        assert_eq!(merged_repr(&merged), ["a(unset)"]);
+    }
+
+    #[test]
+    fn merge_unset_vars_detached_session_surfaces_nothing() {
+        let sessions = vec![
+            detached_session("detached-edit"), // template invisible
+            tmpl_session("plain", "plain"),    // no tokens
+        ];
+        let merged = merge_unset_vars(&[set_var("a", "1")], &sessions);
+        assert_eq!(merged_repr(&merged), ["a=1"]);
+    }
+
+    #[test]
+    fn merge_unset_vars_set_but_empty_var_stays_a_set_row() {
+        // The value is "", but it is a real (set) row: emptiness must not
+        // be confused with unset.
+        let sessions = vec![tmpl_session("-x", "{a}-x")];
+        let merged = merge_unset_vars(&[set_var("a", "")], &sessions);
+        assert_eq!(merged.len(), 1);
+        assert!(!merged[0].unset, "set-but-empty var is not flagged unset");
+        assert_eq!(merged[0].value, "", "value stays the empty string");
+    }
+
+    /// A vars-mode model carrying a real (set) list plus sessions; the
+    /// merge runs so the displayed list mirrors what VarsFetched produces.
+    fn merged_vars_model(real: Vec<Var>, sessions: Vec<Session>) -> Model {
+        let mut m = Model::new(sessions);
+        let vars = merge_unset_vars(&real, &m.sessions);
+        m.mode = Mode::Vars(VarsState {
+            vars,
+            selected: 0,
+            edit: Option::None,
+        });
+        m
+    }
+
+    /// Borrow the VarsState out of a model parked in the vars view.
+    fn vs_of(m: &mut Model) -> &mut VarsState {
+        match &mut m.mode {
+            Mode::Vars(vs) => vs,
+            _ => panic!("expected Mode::Vars"),
+        }
+    }
+
+    #[test]
+    fn remerge_set_one_of_two_unset_siblings_other_survives_cursor_by_name() {
+        // b and c are both unset siblings; the cursor sits on b. Replay the
+        // successful-set sequence: fresh set rows (b now set), cursor
+        // pointed at the promoted var, then a re-merge against the
+        // (unchanged) sessions.
+        let sessions = vec![tmpl_session("B-x", "{b}-x"), tmpl_session("C-x", "{c}-x")];
+        let mut m = merged_vars_model(vec![], clone_sessions(&sessions));
+        assert_eq!(merged_repr(&vs_of(&mut m).vars), ["b(unset)", "c(unset)"]);
+        vs_of(&mut m).selected = 0; // cursor on b
+
+        // Post-set: fresh `var list` (b promoted), cursor at the set var,
+        // then a re-merge against the fresh sessions.
+        let vs = vs_of(&mut m);
+        vs.vars = vec![set_var("b", "foo")];
+        vs.selected = vs.vars.iter().position(|v| v.name == "b").unwrap();
+        remerge_preserving_cursor(vs, &sessions);
+
+        assert_eq!(merged_repr(&vs_of(&mut m).vars), ["b=foo", "c(unset)"]);
+        let vs = vs_of(&mut m);
+        assert_eq!(
+            vs.vars[vs.selected].name, "b",
+            "cursor stays on the promoted var by name across the resort"
+        );
+    }
+
+    #[test]
+    fn remerge_session_refresh_introducing_a_referencing_session_adds_the_unset_row() {
+        let mut sessions = vec![tmpl_session("B-x", "{b}-x")];
+        let mut m = merged_vars_model(vec![set_var("a", "1")], clone_sessions(&sessions));
+        assert_eq!(merged_repr(&vs_of(&mut m).vars), ["a=1", "b(unset)"]);
+        vs_of(&mut m).selected = 1; // cursor on b
+
+        // A refresh brings in a session referencing a new var {c}.
+        sessions.push(tmpl_session("C-x", "{c}-x"));
+        remerge_preserving_cursor(vs_of(&mut m), &sessions);
+        assert_eq!(
+            merged_repr(&vs_of(&mut m).vars),
+            ["a=1", "b(unset)", "c(unset)"]
+        );
+        let vs = vs_of(&mut m);
+        assert_eq!(vs.vars[vs.selected].name, "b", "cursor held on b by name");
+    }
+
+    #[test]
+    fn remerge_refresh_dropping_the_only_referencing_session_removes_its_unset_row() {
+        let sessions = vec![tmpl_session("B-x", "{b}-x"), tmpl_session("C-x", "{c}-x")];
+        let mut m = merged_vars_model(vec![], sessions);
+        assert_eq!(merged_repr(&vs_of(&mut m).vars), ["b(unset)", "c(unset)"]);
+        vs_of(&mut m).selected = 0; // cursor on b
+
+        // c's session goes away; only b remains referenced.
+        let sessions = vec![tmpl_session("B-x", "{b}-x")];
+        remerge_preserving_cursor(vs_of(&mut m), &sessions);
+        assert_eq!(merged_repr(&vs_of(&mut m).vars), ["b(unset)"]);
+        let vs = vs_of(&mut m);
+        assert_eq!(vs.vars[vs.selected].name, "b", "cursor still on b");
+    }
+
+    #[test]
+    fn remerge_cursor_whose_variable_vanished_clamps_to_last_row() {
+        let sessions = vec![tmpl_session("B-x", "{b}-x"), tmpl_session("C-x", "{c}-x")];
+        let mut m = merged_vars_model(vec![], sessions); // [b(unset), c(unset)]
+        vs_of(&mut m).selected = 1; // cursor on c
+
+        // c is no longer referenced AND not set: it disappears entirely.
+        let sessions = vec![tmpl_session("B-x", "{b}-x")];
+        remerge_preserving_cursor(vs_of(&mut m), &sessions);
+        assert_eq!(merged_repr(&vs_of(&mut m).vars), ["b(unset)"]);
+        assert_eq!(vs_of(&mut m).selected, 0, "cursor clamped into bounds");
+    }
+
+    #[test]
+    fn remerge_on_an_empty_list_does_not_panic_or_conjure_a_row() {
+        // An empty vars list (no set vars, nothing referenced) stays empty
+        // across a re-merge — reading the cursor row must not panic or
+        // conjure a row. Mirrors shperl's autovivify guard.
+        let sessions = vec![tmpl_session("plain", "plain")];
+        let mut m = merged_vars_model(vec![], clone_sessions(&sessions));
+        assert!(vs_of(&mut m).vars.is_empty(), "list starts empty");
+        remerge_preserving_cursor(vs_of(&mut m), &sessions);
+        assert!(
+            vs_of(&mut m).vars.is_empty(),
+            "still empty — no phantom row"
+        );
+        assert_eq!(vs_of(&mut m).selected, 0, "cursor pinned at 0");
+    }
+
+    #[test]
+    fn resolution_map_drops_unset_rows() {
+        let list = vec![
+            set_var("editor", "vim"),
+            Var {
+                name: "workspace".into(),
+                value: String::new(),
+                unset: true,
+            },
+        ];
+        let map = resolution_map(&list);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get("editor"), Some(&"vim"));
+        assert_eq!(
+            map.get("workspace"),
+            None,
+            "unset row contributes no key (no synthetic workspace=\"\")"
+        );
     }
 }

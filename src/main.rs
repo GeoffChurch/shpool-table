@@ -11,6 +11,7 @@ use clap::Parser;
 
 use crate::events::{Drain, EventsSub};
 use crate::session::{ListReply, Session};
+use crate::tui::template::unknown_template_vars;
 use crate::tui::{Command, Event, Input, InputParser, Model, Var};
 
 /// Top-level flags. `apply` re-emits the four below — in a fixed order,
@@ -132,9 +133,12 @@ fn list_vars(flags: &Flags) -> Result<Vec<Var>> {
             // Split on the first tab; a value-less line yields an empty
             // value, matching shperl's `split /\t/, $line, 2`.
             let (name, value) = line.split_once('\t').unwrap_or((line, ""));
+            // A var from `var list` is by definition set, even with an
+            // empty value — emptiness is never inferred as unset.
             Var {
                 name: name.to_string(),
                 value: value.to_string(),
+                unset: false,
             }
         })
         .collect();
@@ -488,9 +492,63 @@ fn execute<W: Write>(
             }
         },
         Command::Create(name) => {
-            // Duplicate-name check happened in update; by here it's
-            // safe to spawn. `shpool attach` with a new name creates
+            // Create-time variable prompt detect, BEFORE any teardown:
+            // list the daemon's vars and find the ones the new name
+            // references that aren't set yet. If any, bounce straight back
+            // as CreateNeedsVars — no teardown, no suspend, we stay in the
+            // alt-screen so the prompt renders without a flicker. On a
+            // `var list` failure, abort the create with the error surfaced
+            // (don't attach blind). With every referenced var already set,
+            // fall through to today's teardown -> attach unchanged.
+            //
+            // The duplicate-name check already ran in update (before
+            // Command::Create was emitted), so detection never sees a
+            // duplicate. `shpool attach` with a new name creates
             // atomically on the daemon side.
+            match list_vars(flags) {
+                Ok(set_list) => {
+                    let known: std::collections::HashSet<&str> =
+                        set_list.iter().map(|v| v.name.as_str()).collect();
+                    let vars = unknown_template_vars(&name, &known);
+                    if !vars.is_empty() {
+                        let set_vars = set_list
+                            .into_iter()
+                            .map(|v| (v.name, v.value))
+                            .collect::<Vec<_>>();
+                        return Ok(Some(Event::CreateNeedsVars {
+                            name,
+                            vars,
+                            set_vars,
+                        }));
+                    }
+                }
+                Err(e) => {
+                    model.set_error(format!("shpool var list: {e}"));
+                    return Ok(None);
+                }
+            }
+            teardown_events(events, model);
+            let ok = with_tui_suspended(out, raw, alt, || shell_attach(&name, false, flags))?;
+            Ok(Some(Event::AttachExited { ok, name }))
+        }
+        Command::CreateWithVars { name, set_vars } => {
+            // Apply step: set each collected pair in order
+            // (last-write-wins against any concurrent daemon-side change),
+            // then teardown -> attach exactly like Create. The loop runs
+            // here (not via VarSetFinished) so one Command yields one
+            // follow-up Event, matching run_cascade's shape. On a set
+            // failure, abort with no attach and surface CreateVarsFailed;
+            // partial sets linger (no rollback) — the next detect sees
+            // them as known.
+            for (var, value) in &set_vars {
+                let (ok, err) = set_var(var, value, flags)?;
+                if !ok {
+                    return Ok(Some(Event::CreateVarsFailed {
+                        var: var.clone(),
+                        err,
+                    }));
+                }
+            }
             teardown_events(events, model);
             let ok = with_tui_suspended(out, raw, alt, || shell_attach(&name, false, flags))?;
             Ok(Some(Event::AttachExited { ok, name }))

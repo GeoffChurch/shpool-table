@@ -11,7 +11,11 @@
 use super::command::Command;
 use super::event::Event;
 use super::keymap::{Key, NormalAction, normal_action};
-use super::model::{Mode, Model, Selection, VarsState};
+use super::model::{
+    EditState, Mode, Model, Selection, VarPromptState, VarsState, merge_unset_vars,
+    remerge_preserving_cursor, resolution_map,
+};
+use super::template::{candidate_values, filter_rank};
 
 /// Fold one event into the model. Returns `Some(Command)` if the
 /// event triggers a side effect (attach / kill / create / quit /
@@ -40,6 +44,17 @@ pub fn update(model: &mut Model, event: Event) -> Option<Command> {
         Event::SessionsRefreshed(sessions) => {
             model.refresh(sessions);
             cancel_modal_if_target_gone(model);
+            // In the vars view the displayed list depends on the sessions
+            // just refreshed (the unset rows derive from their templates),
+            // so re-merge against the new list, keeping the cursor on its
+            // variable by name. This also self-corrects the post-`var set`
+            // re-dial: the Refresh that VarSetFinished issues lands here
+            // and re-merges against fresh sessions. Disjoint borrow:
+            // &model.sessions vs &mut model.mode.
+            let sessions = &model.sessions;
+            if let Mode::Vars(vs) = &mut model.mode {
+                remerge_preserving_cursor(vs, sessions);
+            }
             Option::None
         }
         Event::RefreshFailed(msg) => {
@@ -74,8 +89,43 @@ pub fn update(model: &mut Model, event: Event) -> Option<Command> {
             }
             Some(Command::Refresh)
         }
+        Event::CreateNeedsVars {
+            name,
+            vars,
+            set_vars,
+        } => {
+            // The Create detect step found unknown vars (no teardown ran;
+            // we're still in the alt-screen). Open the per-var prompt,
+            // carrying the set-var snapshot so the live preview can resolve
+            // known co-vars. No Command — the prompt drives the next step.
+            model.mode = Mode::CreateVarPrompt(VarPromptState {
+                name,
+                vars,
+                idx: 0,
+                input: String::new(),
+                collected: Vec::new(),
+                set_vars,
+            });
+            Option::None
+        }
+        Event::CreateVarsFailed { var, err } => {
+            // A `var set` in the apply step failed; the create was aborted
+            // with no attach. The prompt already dropped to Normal at
+            // apply-emit (B.4), so this parked error is visible. Partial
+            // sets linger (no rollback) — the next detect sees them as set.
+            // Message mirrors the vars view's `var set <var>: <stderr>`.
+            let msg = match err {
+                Some(e) => format!("var set {var}: {e}"),
+                Option::None => format!("var set {var} failed"),
+            };
+            model.set_error(msg);
+            Option::None
+        }
         Event::VarsFetched(vars) => {
             // Open the vars view on the fresh snapshot, cursor at the top.
+            // Surface the unset rows the current sessions reference; the
+            // cursor resets to 0 so no by-name preservation is needed here.
+            let vars = merge_unset_vars(&vars, &model.sessions);
             model.mode = Mode::Vars(VarsState {
                 vars,
                 selected: 0,
@@ -95,15 +145,23 @@ pub fn update(model: &mut Model, event: Event) -> Option<Command> {
             err,
             vars,
         } => {
-            // Clear the edit line regardless of outcome; on success
-            // swap in the refetched list (preserving the cursor by
-            // index, clamped if the list shrank).
+            // Clear the edit line regardless of outcome; on success swap
+            // in the refetched (set-only) list, point the cursor at the
+            // var we just set by name, then re-merge the unset rows the
+            // current sessions reference (carrying the cursor across the
+            // resort). The set may have promoted an unset row to a set one
+            // or added a brand-new var. The Refresh below also re-merges
+            // against fresh sessions in the SessionsRefreshed arm; doing it
+            // here too keeps the pre-refresh frame consistent. Disjoint
+            // borrow: &model.sessions vs &mut model.mode.
+            let sessions = &model.sessions;
             if let Mode::Vars(vs) = &mut model.mode {
                 vs.edit = Option::None;
                 if ok {
                     if let Some(v) = vars {
-                        vs.selected = vs.selected.min(v.len().saturating_sub(1));
+                        vs.selected = v.iter().position(|x| x.name == name).unwrap_or(0);
                         vs.vars = v;
+                        remerge_preserving_cursor(vs, sessions);
                     }
                 }
             }
@@ -158,8 +216,9 @@ fn clear_pre_action_alert(model: &mut Model) {
 
 /// Drop a kill / force-attach modal whose target session has vanished
 /// from under it — any refresh (event-driven, focus, the keystroke
-/// fallback) can race ahead of the user mid-prompt. CreateInput is
-/// safe: its buffer is a name being typed, not a session reference.
+/// fallback) can race ahead of the user mid-prompt. CreateInput and
+/// CreateVarPrompt are safe: their state is a name/value being typed,
+/// not a reference to an existing session.
 fn cancel_modal_if_target_gone(model: &mut Model) {
     let target = match &model.mode {
         Mode::ConfirmKill(name) | Mode::ConfirmForce(name) => name.clone(),
@@ -175,6 +234,7 @@ fn handle_key(model: &mut Model, key: Key) -> Option<Command> {
     match &model.mode {
         Mode::Normal => handle_key_normal(model, key),
         Mode::CreateInput(_) => handle_key_create(model, key),
+        Mode::CreateVarPrompt(_) => handle_key_create_vars(model, key),
         Mode::ConfirmKill(_) | Mode::ConfirmForce(_) => handle_key_confirm(model, key),
         Mode::Vars(_) => handle_key_vars(model, key),
     }
@@ -289,6 +349,60 @@ fn handle_key_create(model: &mut Model, key: Key) -> Option<Command> {
     }
 }
 
+/// Handle a key in the create-time variable prompt. Walks the unknown
+/// vars one at a time: printable bytes (incl. space — values may hold
+/// spaces, unlike session names) / Backspace edit the current `input`;
+/// Enter pushes `(vars[idx], input)` to `collected` when non-empty (an
+/// empty entry skips that var — it stays unset, surfaced later by the
+/// vars view) and advances `idx`. Once every var has been visited, drop
+/// to Normal (so a failed apply's error isn't hidden behind this
+/// bottom-bar label — the modal-over-error rule) and emit
+/// Command::CreateWithVars with the collected pairs. Esc/Ctrl-C cancel
+/// the whole prompt (nothing set, no session created). Other keys
+/// (arrows, Tab, unmapped CSI -> Key::Other) are consumed.
+fn handle_key_create_vars(model: &mut Model, key: Key) -> Option<Command> {
+    let Mode::CreateVarPrompt(vp) = &mut model.mode else {
+        return Option::None;
+    };
+    match key {
+        Key::Esc | Key::Ctrl(0x03) => {
+            model.mode = Mode::Normal;
+            Option::None
+        }
+        Key::Enter => {
+            if !vp.input.is_empty() {
+                let var = vp.vars[vp.idx].clone();
+                let value = std::mem::take(&mut vp.input);
+                vp.collected.push((var, value));
+            }
+            vp.idx += 1;
+            if vp.idx == vp.vars.len() {
+                // Drop to Normal before emitting so an apply failure's
+                // parked error isn't outranked by this prompt's label.
+                let name = vp.name.clone();
+                let set_vars = std::mem::take(&mut vp.collected);
+                model.mode = Mode::Normal;
+                Some(Command::CreateWithVars { name, set_vars })
+            } else {
+                vp.input.clear();
+                Option::None
+            }
+        }
+        Key::Backspace => {
+            vp.input.pop();
+            Option::None
+        }
+        // Printable ASCII, space included (the decoder already filtered
+        // non-ASCII bytes to Key::Other).
+        Key::Char(b) => {
+            vp.input.push(b as char);
+            Option::None
+        }
+        // Other keys (arrows, Tab, Key::Other): consumed, input untouched.
+        _ => Option::None,
+    }
+}
+
 /// Handle a key in either confirm modal (kill or force-attach). y/Y
 /// confirms; n/N/Esc/Ctrl-C cancels; every other key — arrows, stray
 /// letters, a fat-fingered space — is ignored so the prompt stays put.
@@ -324,46 +438,83 @@ fn handle_key_confirm(model: &mut Model, key: Key) -> Option<Command> {
 /// Handle a key in the template-variable view. Two sub-states keyed off
 /// `edit`:
 ///   browsing (`edit == None`) — j/k/arrows move the cursor (wrapping);
-///     e/Enter open the value line prefilled with the current value;
-///     Esc/q/Ctrl-C return to the session list. `Q` and everything else
-///     are ignored (matching shperl — `Q` is not a leave key here).
-///   editing (`edit == Some(buf)`) — printable bytes (incl. space)
-///     accumulate; Backspace pops; Enter commits a Command::SetVar; Esc/
-///     Ctrl-C cancel the edit (the variable stays selected). Arrows and
-///     other non-printables are ignored.
+///     e/Enter open the value selector (field empty, current value just
+///     the highlighted row); Esc/q/Ctrl-C return to the session list.
+///     `Q` and everything else are ignored (matching shperl — `Q` is not
+///     a leave key here).
+///   editing (`edit == Some(_)`) — the value selector. Up/Down move the
+///     highlight within the candidate list (copying the highlighted value
+///     into `field`, leaving `filter` frozen so the list stays put);
+///     printable bytes (incl. space) / Backspace edit `field`, refresh
+///     `filter` from it, and reset the highlight to the top; Enter commits
+///     a Command::SetVar — applying `field`, or the highlighted candidate
+///     when `field` is empty; Esc/Ctrl-C cancel the edit. Other
+///     non-printables are ignored.
 fn handle_key_vars(model: &mut Model, key: Key) -> Option<Command> {
+    // Split the borrow: the harvest path reads `sessions` while mutating
+    // `mode`, and the two fields are disjoint.
+    let sessions = &model.sessions;
     let Mode::Vars(vs) = &mut model.mode else {
         return Option::None;
     };
 
-    // Editing sub-state.
-    if let Some(buf) = &mut vs.edit {
+    // Editing sub-state (the value selector).
+    if let Some(edit) = &mut vs.edit {
         match key {
             Key::Esc | Key::Ctrl(0x03) => {
                 vs.edit = Option::None;
                 Option::None
             }
+            // Up/Down move the highlight within the shown list and copy
+            // the highlighted candidate into the field; the filter is left
+            // frozen so the list stays stable while arrowing.
+            Key::Up | Key::Down => {
+                let shown = filter_rank(&edit.candidates, &edit.filter);
+                if !shown.is_empty() {
+                    let last = shown.len() - 1;
+                    edit.highlight = match key {
+                        Key::Down => (edit.highlight + 1).min(last),
+                        // Up: clamp at 0, saturating so it never wraps.
+                        _ => edit.highlight.saturating_sub(1),
+                    };
+                    edit.field = shown[edit.highlight].clone();
+                }
+                Option::None
+            }
             Key::Enter => {
-                // Commit: move the buffer out as the value; the name is
-                // the selected variable. The edit sub-state is cleared
-                // when VarSetFinished lands.
-                let value = std::mem::take(buf);
+                // Empty field => apply the highlighted row (= the current
+                // value, since an empty filter shows it first); otherwise
+                // apply the literal field (no dead zone — `xm` is applied
+                // as `xm` even while `xmr` is shown). The edit sub-state is
+                // cleared when VarSetFinished lands.
+                let value = if edit.field.is_empty() {
+                    let shown = filter_rank(&edit.candidates, &edit.filter);
+                    shown.get(edit.highlight).cloned().unwrap_or_default()
+                } else {
+                    std::mem::take(&mut edit.field)
+                };
                 vs.vars.get(vs.selected).map(|v| Command::SetVar {
                     name: v.name.clone(),
                     value,
                 })
             }
             Key::Backspace => {
-                buf.pop();
+                edit.field.pop();
+                edit.filter = edit.field.clone();
+                edit.highlight = 0;
                 Option::None
             }
-            // Values may hold spaces (e.g. nothing rejects them here),
-            // so space is accepted unlike in the create-name prompt.
+            // Values may hold spaces (nothing rejects them here), so space
+            // is accepted unlike in the create-name prompt. A typing
+            // keystroke snaps the highlight back to the top.
             Key::Char(b) => {
-                buf.push(b as char);
+                edit.field.push(b as char);
+                edit.filter = edit.field.clone();
+                edit.highlight = 0;
                 Option::None
             }
-            // Arrows and other non-printables: ignored.
+            // Other non-printables (Tab, unmapped CSI -> Key::Other): the
+            // sequence is consumed, the field untouched.
             _ => Option::None,
         }
     } else {
@@ -379,10 +530,24 @@ fn handle_key_vars(model: &mut Model, key: Key) -> Option<Command> {
                 Option::None
             }
             Key::Enter | Key::Char(b'e') => {
-                // Open the value line, prefilled with the current value.
-                // No-op on an empty list (no variable to edit).
-                if let Some(v) = vs.vars.get(vs.selected) {
-                    vs.edit = Some(v.value.clone());
+                // Open the value selector: harvest candidates from existing
+                // session names, start with an empty field/filter (the
+                // current value is just the highlighted row, not prefilled
+                // text), highlight the first row. No-op on an empty list.
+                if vs.vars.get(vs.selected).is_some() {
+                    // Map from real (!unset) rows only, so a synthetic unset
+                    // co-var can't collapse a literal {name} to empty in the
+                    // harvest. An unset target itself is fine: its current
+                    // value reads as "" with no panic.
+                    let vmap = resolution_map(&vs.vars);
+                    let name = vs.vars[vs.selected].name.as_str();
+                    let candidates = candidate_values(sessions, &vmap, name);
+                    vs.edit = Some(EditState {
+                        field: String::new(),
+                        filter: String::new(),
+                        candidates,
+                        highlight: 0,
+                    });
                 }
                 Option::None
             }
@@ -961,13 +1126,40 @@ mod tests {
         Var {
             name: name.to_string(),
             value: value.to_string(),
+            unset: false,
         }
     }
 
-    /// A model parked in the vars view with two variables, cursor at 0.
-    /// Mirrors shperl's make_vars_model fixture.
+    /// Sessions dialed in with `{workspace}-...` / `{editor}-notes`
+    /// templates so `workspace` governs two attachments and `editor`
+    /// harvests `vim`. Mirrors shperl's vars_sessions fixture.
+    fn vars_sessions() -> Vec<Session> {
+        vec![
+            attached_sess("myproj-edit", "{workspace}-edit", 111),
+            attached_sess("myproj-term", "{workspace}-term", 222),
+            attached_sess("vim-notes", "{editor}-notes", 333),
+        ]
+    }
+
+    fn attached_sess(name: &str, template: &str, pid: u64) -> Session {
+        use crate::session::Attachment;
+        Session {
+            name: name.to_string(),
+            attached: true,
+            started_at_unix_ms: 0,
+            last_connected_at_unix_ms: 0,
+            last_disconnected_at_unix_ms: None,
+            attachments: vec![Attachment {
+                session_name_template: template.to_string(),
+                pid,
+            }],
+        }
+    }
+
+    /// A model parked in the vars view with two variables, cursor at 0,
+    /// over the templated sessions. Mirrors shperl's make_vars_model.
     fn vars_model() -> Model {
-        let mut m = Model::new(vec![]);
+        let mut m = Model::new(vars_sessions());
         m.mode = Mode::Vars(VarsState {
             vars: vec![var("editor", "vim"), var("workspace", "myproj")],
             selected: 0,
@@ -984,6 +1176,14 @@ mod tests {
             panic!("expected Mode::Vars, got {:?}", m.mode);
         };
         vs
+    }
+
+    /// The value-selector edit state, panicking if not editing.
+    fn edit(m: &Model) -> &EditState {
+        vars(m)
+            .edit
+            .as_ref()
+            .unwrap_or_else(|| panic!("expected an active edit"))
     }
 
     #[test]
@@ -1033,23 +1233,27 @@ mod tests {
     }
 
     #[test]
-    fn vars_edit_e_prefills_then_enter_commits() {
-        // Ports "vars edit: e opens the value line prefilled; chars +
-        // Enter commit". Asserts the emitted Command::SetVar, not a
-        // shell-out.
+    fn vars_edit_e_opens_empty_field_then_enter_commits() {
+        // `e` opens the value selector with an empty field (the current
+        // value is just the highlighted row, not prefilled text); typing +
+        // Enter commit the typed value. Asserts the emitted Command::SetVar,
+        // not a shell-out.
         let mut m = vars_model(); // selected 0 = editor=vim
         update(&mut m, key(Key::Char(b'e')));
-        assert_eq!(vars(&m).edit.as_deref(), Some("vim"), "prefilled");
-        // Backspace x3 -> empty.
-        update(&mut m, key(Key::Backspace));
-        update(&mut m, key(Key::Backspace));
-        update(&mut m, key(Key::Backspace));
-        assert_eq!(vars(&m).edit.as_deref(), Some(""), "backspaced empty");
+        let e = edit(&m);
+        assert_eq!(e.field, "", "field starts empty (no prefill)");
+        assert_eq!(e.filter, "", "filter starts empty");
+        assert_eq!(e.highlight, 0, "highlight starts at the top");
+        assert_eq!(
+            e.candidates,
+            vec!["vim".to_string()],
+            "candidates harvested ({{editor}}-notes -> vim)"
+        );
         // Type "nano".
         for b in b"nano" {
             update(&mut m, key(Key::Char(*b)));
         }
-        assert_eq!(vars(&m).edit.as_deref(), Some("nano"));
+        assert_eq!(edit(&m).field, "nano", "typed new value into the field");
         let cmd = update(&mut m, key(Key::Enter));
         assert_eq!(
             cmd,
@@ -1063,17 +1267,14 @@ mod tests {
     #[test]
     fn vars_edit_accepts_spaces_in_value() {
         // Values may hold spaces (unlike session names) — the create
-        // prompt drops them, the vars edit line keeps them.
+        // prompt drops them, the vars edit field keeps them. The field
+        // starts empty now, so no prefill to clear first.
         let mut m = vars_model();
         update(&mut m, key(Key::Char(b'e')));
-        // Clear the prefill, then type "key bugfix".
-        for _ in 0..3 {
-            update(&mut m, key(Key::Backspace));
-        }
         for b in b"key bugfix" {
             update(&mut m, key(Key::Char(*b)));
         }
-        assert_eq!(vars(&m).edit.as_deref(), Some("key bugfix"));
+        assert_eq!(edit(&m).field, "key bugfix");
     }
 
     #[test]
@@ -1082,9 +1283,268 @@ mod tests {
         let mut m = vars_model();
         update(&mut m, key(Key::Char(b'e')));
         update(&mut m, key(Key::Char(b'x')));
-        assert_eq!(vars(&m).edit.as_deref(), Some("vimx"));
+        assert_eq!(edit(&m).field, "x", "typed into the field");
         update(&mut m, key(Key::Esc));
         assert_eq!(vars(&m).edit, None, "edit cancelled");
+        assert!(matches!(m.mode, Mode::Vars(_)), "still in the vars view");
+    }
+
+    // -- value-selector state machine --
+
+    /// A model mid-edit on a single variable `v` (current `djt`), with
+    /// sessions shaped so `{v}-edit` harvests the given captured values
+    /// (current value first via candidate_values). Mirrors shperl's
+    /// vars_edit_model.
+    fn vars_edit_model(cand_names: &[&str]) -> Model {
+        let mut sessions = vec![attached_sess("djt-edit", "{v}-edit", 1)];
+        for name in cand_names {
+            sessions.push(detached_sess(&format!("{name}-edit")));
+        }
+        let mut m = Model::new(sessions);
+        m.mode = Mode::Vars(VarsState {
+            vars: vec![var("v", "djt")],
+            selected: 0,
+            edit: Option::None,
+        });
+        // Open the selector via the real key path so the harvest runs.
+        update(&mut m, key(Key::Char(b'e')));
+        m
+    }
+
+    fn detached_sess(name: &str) -> Session {
+        Session {
+            name: name.to_string(),
+            attached: false,
+            started_at_unix_ms: 0,
+            last_connected_at_unix_ms: 0,
+            last_disconnected_at_unix_ms: None,
+            attachments: Vec::new(),
+        }
+    }
+
+    /// `shown` = the filtered/ranked candidate list for the current filter.
+    fn shown(m: &Model) -> Vec<String> {
+        let e = edit(m);
+        filter_rank(&e.candidates, &e.filter)
+    }
+
+    #[test]
+    fn selector_arrows_fill_field_and_do_not_refilter() {
+        // Ports shperl's "value selector: arrows fill the field and do not
+        // re-filter". Down copies the highlighted candidate into the field
+        // while the filter stays frozen; Down clamps at the last row; Up
+        // walks back.
+        let mut m = vars_edit_model(&["xmr", "xrp"]); // cands: djt, xmr, xrp
+        assert_eq!(
+            edit(&m).candidates,
+            vec!["djt".to_string(), "xmr".to_string(), "xrp".to_string()],
+            "candidates harvested",
+        );
+        update(&mut m, key(Key::Down));
+        assert_eq!(edit(&m).highlight, 1, "Down moves the highlight");
+        assert_eq!(
+            edit(&m).field,
+            "xmr",
+            "highlighted candidate copied into field"
+        );
+        assert_eq!(edit(&m).filter, "", "filter stays frozen while arrowing");
+        update(&mut m, key(Key::Down));
+        assert_eq!(edit(&m).field, "xrp", "Down again -> next candidate");
+        update(&mut m, key(Key::Down));
+        assert_eq!(edit(&m).highlight, 2, "Down clamps at the last row");
+        update(&mut m, key(Key::Up));
+        assert_eq!(edit(&m).field, "xmr", "Up walks back up the list");
+    }
+
+    #[test]
+    fn selector_typing_filters_and_resets_highlight() {
+        // Ports "value selector: typing filters and resets the highlight".
+        let mut m = vars_edit_model(&["xmr", "xrp"]); // cands: djt, xmr, xrp
+        update(&mut m, key(Key::Char(b'x')));
+        assert_eq!(edit(&m).field, "x", "char appended to the field");
+        assert_eq!(edit(&m).filter, "x", "filter follows the field when typing");
+        assert_eq!(
+            edit(&m).highlight,
+            0,
+            "highlight at the top after first char"
+        );
+        assert_eq!(shown(&m), vec!["xmr", "xrp"], "shown narrowed to x-matches");
+        update(&mut m, key(Key::Char(b'm')));
+        assert_eq!(edit(&m).filter, "xm", "filter keeps following the field");
+        assert_eq!(shown(&m), vec!["xmr"], "filter narrowed further to xm");
+
+        // A typing keystroke snaps the highlight back to the top even after
+        // an arrow moved it.
+        let mut m = vars_edit_model(&["xmr", "xrp"]);
+        update(&mut m, key(Key::Char(b'x'))); // shown = [xmr, xrp]
+        update(&mut m, key(Key::Down)); // highlight 1
+        assert_eq!(
+            edit(&m).highlight,
+            1,
+            "arrowed down within the filtered list"
+        );
+        update(&mut m, key(Key::Char(b'q'))); // any printable
+        assert_eq!(
+            edit(&m).highlight,
+            0,
+            "highlight reset to the top by typing"
+        );
+    }
+
+    #[test]
+    fn selector_arrow_then_type_extends_field_and_filters() {
+        // Ports "value selector: arrow-then-type (field becomes prefix,
+        // filter follows)".
+        let mut m = vars_edit_model(&["xmr", "xrp"]); // cands: djt, xmr, xrp
+        update(&mut m, key(Key::Down)); // highlight xmr, field=xmr
+        assert_eq!(edit(&m).field, "xmr", "arrow copied xmr into the field");
+        update(&mut m, key(Key::Char(b'z'))); // type onto the copied text
+        assert_eq!(
+            edit(&m).field,
+            "xmrz",
+            "typed char extends the arrowed-in value"
+        );
+        assert_eq!(edit(&m).filter, "xmrz", "filter now equals the field");
+        assert_eq!(
+            edit(&m).highlight,
+            0,
+            "highlight reset by the typing keystroke"
+        );
+        assert!(shown(&m).is_empty(), "nothing matches xmrz");
+        let cmd = update(&mut m, key(Key::Enter));
+        assert_eq!(
+            cmd,
+            Some(Command::SetVar {
+                name: "v".into(),
+                value: "xmrz".into(),
+            }),
+            "Enter applies the free-text field",
+        );
+    }
+
+    #[test]
+    fn selector_non_arrow_key_is_consumed_without_touching_field() {
+        // Ports shperl's "a non-arrow CSI final is consumed, not typed":
+        // an unmapped key (Key::Other) or Tab is swallowed by the edit
+        // branch — field/filter/highlight unchanged, no command emitted.
+        let mut m = vars_edit_model(&["xmr", "xrp"]); // cands: djt, xmr, xrp
+        update(&mut m, key(Key::Down)); // highlight 1, field=xmr, filter frozen
+        assert_eq!(
+            update(&mut m, key(Key::Other)),
+            None,
+            "Key::Other emits no command"
+        );
+        assert_eq!(
+            edit(&m).field,
+            "xmr",
+            "Key::Other leaves the field untouched"
+        );
+        assert_eq!(
+            edit(&m).filter,
+            "",
+            "Key::Other leaves the filter untouched"
+        );
+        assert_eq!(
+            edit(&m).highlight,
+            1,
+            "Key::Other leaves the highlight untouched"
+        );
+        assert_eq!(update(&mut m, key(Key::Tab)), None, "Tab emits no command");
+        assert_eq!(edit(&m).field, "xmr", "Tab leaves the field untouched");
+        assert_eq!(edit(&m).highlight, 1, "Tab leaves the highlight untouched");
+    }
+
+    #[test]
+    fn selector_empty_field_enter_keeps_current_value() {
+        // Ports "value selector: empty field => Enter keeps the current
+        // value" — the highlighted row is the current value, shown first.
+        let mut m = vars_edit_model(&["xmr", "xrp"]); // cands: djt(current), xmr, xrp
+        assert_eq!(edit(&m).field, "", "field empty on entry");
+        let cmd = update(&mut m, key(Key::Enter));
+        assert_eq!(
+            cmd,
+            Some(Command::SetVar {
+                name: "v".into(),
+                value: "djt".into(),
+            }),
+            "empty field -> highlighted row (the current value) is applied",
+        );
+    }
+
+    #[test]
+    fn selector_empty_field_after_backspacing_keeps_current() {
+        // Ports "value selector: empty field after backspacing also keeps
+        // current".
+        let mut m = vars_edit_model(&["xmr", "xrp"]);
+        update(&mut m, key(Key::Char(b'x'))); // field=x
+        update(&mut m, key(Key::Backspace)); // -> empty
+        assert_eq!(edit(&m).field, "", "backspaced to empty");
+        assert_eq!(edit(&m).highlight, 0, "highlight back at the top");
+        let cmd = update(&mut m, key(Key::Enter));
+        assert_eq!(
+            cmd,
+            Some(Command::SetVar {
+                name: "v".into(),
+                value: "djt".into(),
+            }),
+            "still applies the current value",
+        );
+    }
+
+    #[test]
+    fn selector_literal_field_is_not_a_dead_zone() {
+        // Ports "value selector: literal field is not a dead zone (xm vs
+        // xmr)" — Enter applies the literal `xm` even while `xmr` is the
+        // shown suggestion.
+        let mut m = vars_edit_model(&["xmr"]); // cands: djt, xmr
+        for b in b"xm" {
+            update(&mut m, key(Key::Char(*b)));
+        }
+        assert_eq!(edit(&m).field, "xm", "field holds the literal typed text");
+        assert_eq!(shown(&m), vec!["xmr"], "xmr shown as the suggestion");
+        let cmd = update(&mut m, key(Key::Enter));
+        assert_eq!(
+            cmd,
+            Some(Command::SetVar {
+                name: "v".into(),
+                value: "xm".into(),
+            }),
+            "Enter applies the literal xm, not the shown xmr",
+        );
+    }
+
+    #[test]
+    fn selector_arrow_to_suggestion_then_enter_applies_it() {
+        // Ports "value selector: arrowing to a suggestion then Enter
+        // applies it".
+        let mut m = vars_edit_model(&["xmr"]); // cands: djt, xmr
+        for b in b"xm" {
+            update(&mut m, key(Key::Char(*b)));
+        }
+        update(&mut m, key(Key::Down)); // highlight xmr, field=xmr
+        assert_eq!(
+            edit(&m).field,
+            "xmr",
+            "arrow filled the field with the suggestion"
+        );
+        let cmd = update(&mut m, key(Key::Enter));
+        assert_eq!(
+            cmd,
+            Some(Command::SetVar {
+                name: "v".into(),
+                value: "xmr".into(),
+            }),
+            "now xmr is applied",
+        );
+    }
+
+    #[test]
+    fn selector_esc_cancels_and_clears_edit_state() {
+        // Ports "value selector: Esc cancels and clears the edit state".
+        let mut m = vars_edit_model(&["xmr", "xrp"]);
+        update(&mut m, key(Key::Down)); // field=xmr
+        update(&mut m, key(Key::Esc));
+        assert_eq!(vars(&m).edit, None, "no longer editing");
         assert!(matches!(m.mode, Mode::Vars(_)), "still in the vars view");
     }
 
@@ -1202,5 +1662,497 @@ mod tests {
         });
         assert_eq!(update(&mut m, key(Key::Char(b'e'))), None);
         assert_eq!(vars(&m).edit, None, "no edit opened on empty list");
+    }
+
+    // -- Feature A: union of unset rows (the update wiring) --
+
+    use super::super::template::resolve_template;
+    use crate::session::Attachment;
+
+    /// A session whose single attachment carries `tmpl`.
+    fn tmpl_session(name: &str, tmpl: &str) -> Session {
+        Session {
+            name: name.to_string(),
+            attached: true,
+            started_at_unix_ms: 0,
+            last_connected_at_unix_ms: 0,
+            last_disconnected_at_unix_ms: None,
+            attachments: vec![Attachment {
+                session_name_template: tmpl.to_string(),
+                pid: 1,
+            }],
+        }
+    }
+
+    /// Flatten a vars list to `name=value` / `name(unset)` tokens.
+    fn merged_repr(vs: &VarsState) -> Vec<String> {
+        vs.vars
+            .iter()
+            .map(|v| {
+                if v.unset {
+                    format!("{}(unset)", v.name)
+                } else {
+                    format!("{}={}", v.name, v.value)
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn vars_fetched_merges_unset_rows_against_sessions() {
+        // A.3a: opening the view surfaces the unset rows the current
+        // sessions reference, interleaved with the set rows by name.
+        let mut m = Model::new(vec![tmpl_session("B-x", "{b}-x")]);
+        let cmd = update(&mut m, Event::VarsFetched(vec![var("a", "1")]));
+        assert_eq!(cmd, None);
+        assert_eq!(merged_repr(vars(&m)), ["a=1", "b(unset)"]);
+        assert_eq!(vars(&m).selected, 0, "cursor resets to the top");
+    }
+
+    #[test]
+    fn vars_set_finished_keeps_unset_sibling_and_cursor_by_name() {
+        // A.3b refetch regression: two unset siblings b, c; the cursor is
+        // on b. A successful set of b refetches the set rows; b is promoted
+        // and c must survive as unset, with the cursor still on b by name
+        // after the resort.
+        let mut m = Model::new(vec![
+            tmpl_session("B-x", "{b}-x"),
+            tmpl_session("C-x", "{c}-x"),
+        ]);
+        update(&mut m, Event::VarsFetched(vec![]));
+        assert_eq!(merged_repr(vars(&m)), ["b(unset)", "c(unset)"]);
+        // Cursor is at 0 (b). Open the selector so the edit line is live,
+        // then deliver the set result with a refetched set list.
+        update(&mut m, key(Key::Char(b'e')));
+        let cmd = update(
+            &mut m,
+            Event::VarSetFinished {
+                name: "b".into(),
+                ok: true,
+                err: Option::None,
+                vars: Some(vec![var("b", "foo")]),
+            },
+        );
+        assert_eq!(cmd, Some(Command::Refresh));
+        assert_eq!(
+            merged_repr(vars(&m)),
+            ["b=foo", "c(unset)"],
+            "b promoted; c survives as unset"
+        );
+        let vs = vars(&m);
+        assert_eq!(
+            vs.vars[vs.selected].name, "b",
+            "cursor stays on the promoted var by name"
+        );
+        assert_eq!(vs.edit, None, "edit line cleared");
+    }
+
+    #[test]
+    fn sessions_refreshed_in_vars_mode_adds_unset_row_and_keeps_cursor() {
+        // A.3c session-refresh regression (add): a refresh introducing a
+        // session that references a new var surfaces it as an unset row,
+        // cursor held by name.
+        let mut m = Model::new(vec![tmpl_session("B-x", "{b}-x")]);
+        update(&mut m, Event::VarsFetched(vec![var("a", "1")]));
+        assert_eq!(merged_repr(vars(&m)), ["a=1", "b(unset)"]);
+        // Move the cursor onto b.
+        update(&mut m, key(Key::Char(b'j')));
+        assert_eq!(vars(&m).vars[vars(&m).selected].name, "b");
+
+        update(
+            &mut m,
+            Event::SessionsRefreshed(vec![
+                tmpl_session("B-x", "{b}-x"),
+                tmpl_session("C-x", "{c}-x"),
+            ]),
+        );
+        assert_eq!(merged_repr(vars(&m)), ["a=1", "b(unset)", "c(unset)"]);
+        let vs = vars(&m);
+        assert_eq!(vs.vars[vs.selected].name, "b", "cursor held on b by name");
+    }
+
+    #[test]
+    fn sessions_refreshed_in_vars_mode_removes_unset_row_and_clamps_cursor() {
+        // A.3c (remove + clamp): a refresh that drops the only session
+        // referencing the selected unset var removes its row; the cursor,
+        // whose var vanished, clamps to the last row.
+        let mut m = Model::new(vec![
+            tmpl_session("B-x", "{b}-x"),
+            tmpl_session("C-x", "{c}-x"),
+        ]);
+        update(&mut m, Event::VarsFetched(vec![]));
+        assert_eq!(merged_repr(vars(&m)), ["b(unset)", "c(unset)"]);
+        update(&mut m, key(Key::Char(b'j'))); // cursor on c
+        assert_eq!(vars(&m).vars[vars(&m).selected].name, "c");
+
+        update(
+            &mut m,
+            Event::SessionsRefreshed(vec![tmpl_session("B-x", "{b}-x")]),
+        );
+        assert_eq!(merged_repr(vars(&m)), ["b(unset)"]);
+        assert_eq!(vars(&m).selected, 0, "cursor clamped into bounds");
+    }
+
+    #[test]
+    fn map_unchanged_candidate_harvest_ignores_an_unset_co_var() {
+        // A.1 map-unchanged (candidate_values site): workspace is set;
+        // editor is an unset co-var in the template. Opening the value
+        // selector on workspace must harvest the same candidates as if the
+        // unset row were absent — {editor} stays literal, so the
+        // "{editor}-" prefix never spuriously matches and collapses.
+        let sessions = vec![
+            tmpl_session("{editor}-myproj", "{editor}-{workspace}"),
+            // detached target carrying the literal-prefix name.
+            Session {
+                name: "{editor}-demo".into(),
+                attached: false,
+                started_at_unix_ms: 0,
+                last_connected_at_unix_ms: 0,
+                last_disconnected_at_unix_ms: None,
+                attachments: Vec::new(),
+            },
+        ];
+        // Pre-union baseline: harvest with only the real row in the map.
+        // Computed before `sessions` moves into the model.
+        let real = [var("workspace", "myproj")];
+        let map = resolution_map(&real);
+        let pre_union = candidate_values(&sessions, &map, "workspace");
+
+        let mut m = Model::new(sessions);
+        update(&mut m, Event::VarsFetched(vec![var("workspace", "myproj")]));
+        // editor surfaced as an unset co-var row.
+        assert!(
+            vars(&m).vars.iter().any(|v| v.name == "editor" && v.unset),
+            "editor surfaced as an unset row"
+        );
+        // Point the cursor at the set var and open the selector.
+        let wi = vars(&m)
+            .vars
+            .iter()
+            .position(|v| v.name == "workspace")
+            .unwrap();
+        if let Mode::Vars(vs) = &mut m.mode {
+            vs.selected = wi;
+        }
+        update(&mut m, key(Key::Char(b'e')));
+        let with_union = edit(&m).candidates.clone();
+
+        assert_eq!(
+            with_union, pre_union,
+            "candidate harvest is identical with vs. without the unset row"
+        );
+        assert_eq!(
+            with_union,
+            vec!["myproj".to_string(), "demo".to_string()],
+            "captures are the remainders after the literal {{editor}}- prefix"
+        );
+    }
+
+    #[test]
+    fn map_unchanged_preview_keeps_unset_co_var_literal() {
+        // A.1 map-unchanged (preview site): the re-dial preview for a set
+        // var whose template also mentions an unset var leaves the unset
+        // token literal, not collapsed to empty. Resolve against the same
+        // map the preview uses (real rows only).
+        let sessions = vec![tmpl_session("{editor}-myproj", "{editor}-{workspace}")];
+        let mut m = Model::new(sessions);
+        update(&mut m, Event::VarsFetched(vec![var("workspace", "myproj")]));
+        let vs = vars(&m);
+        let map = resolution_map(&vs.vars);
+        assert_eq!(
+            resolve_template("{editor}-{workspace}", &map),
+            "{editor}-myproj",
+            "unknown {{editor}} stays literal, not collapsed to -myproj"
+        );
+    }
+
+    #[test]
+    fn set_but_empty_var_stays_a_set_row_through_fetch() {
+        // A var with an empty value is a real (set) row, never flagged
+        // unset, even when its name is referenced by a template.
+        let mut m = Model::new(vec![tmpl_session("-x", "{a}-x")]);
+        update(&mut m, Event::VarsFetched(vec![var("a", "")]));
+        let vs = vars(&m);
+        assert_eq!(vs.vars.len(), 1);
+        assert!(!vs.vars[0].unset, "set-but-empty var is not flagged unset");
+        assert_eq!(vs.vars[0].value, "");
+    }
+
+    // -- Feature B: create-time variable prompt --
+
+    /// Borrow the VarPromptState out of a model parked in the prompt,
+    /// panicking otherwise — keeps tests asserting on fields.
+    fn vp(m: &Model) -> &VarPromptState {
+        let Mode::CreateVarPrompt(vp) = &m.mode else {
+            panic!("expected Mode::CreateVarPrompt, got {:?}", m.mode);
+        };
+        vp
+    }
+
+    /// A model parked in the create-var prompt over `vars` (with no
+    /// pre-set co-vars), as the CreateNeedsVars handler builds it.
+    fn prompt_model(name: &str, names: &[&str]) -> Model {
+        let mut m = Model::new(vec![]);
+        update(
+            &mut m,
+            Event::CreateNeedsVars {
+                name: name.to_string(),
+                vars: names.iter().map(|s| s.to_string()).collect(),
+                set_vars: Vec::new(),
+            },
+        );
+        m
+    }
+
+    /// Feed a run of printable chars as individual keystrokes.
+    fn type_str(m: &mut Model, s: &str) {
+        for b in s.bytes() {
+            update(m, key(Key::Char(b)));
+        }
+    }
+
+    #[test]
+    fn create_needs_vars_opens_prompt() {
+        // The detect-step event opens the prompt at idx 0 with empty input
+        // and carries the set-var snapshot for the preview.
+        let mut m = Model::new(vec![]);
+        let cmd = update(
+            &mut m,
+            Event::CreateNeedsVars {
+                name: "{a}-{b}".into(),
+                vars: vec!["a".into(), "b".into()],
+                set_vars: vec![("c".into(), "see".into())],
+            },
+        );
+        assert_eq!(cmd, None, "opening the prompt emits no command");
+        let p = vp(&m);
+        assert_eq!(p.name, "{a}-{b}");
+        assert_eq!(p.vars, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(p.idx, 0);
+        assert_eq!(p.input, "");
+        assert!(p.collected.is_empty());
+        assert_eq!(p.set_vars, vec![("c".to_string(), "see".to_string())]);
+    }
+
+    #[test]
+    fn create_prompt_single_var_collects_then_emits() {
+        // A single unknown var: type a value, Enter emits CreateWithVars
+        // with the one pair and drops to Normal.
+        let mut m = prompt_model("{a}-x", &["a"]);
+        type_str(&mut m, "hello");
+        assert_eq!(vp(&m).input, "hello", "input accumulates printable bytes");
+        let cmd = update(&mut m, key(Key::Enter));
+        assert_eq!(
+            cmd,
+            Some(Command::CreateWithVars {
+                name: "{a}-x".into(),
+                set_vars: vec![("a".into(), "hello".into())],
+            }),
+            "Enter on the last var emits the apply command with the pair"
+        );
+        assert_eq!(
+            m.mode,
+            Mode::Normal,
+            "dropped to Normal at apply-emit (B.4)"
+        );
+    }
+
+    #[test]
+    fn create_prompt_multiple_vars_collected_in_order() {
+        let mut m = prompt_model("{a}-{b}", &["a", "b"]);
+        type_str(&mut m, "one");
+        update(&mut m, key(Key::Enter));
+        assert!(
+            matches!(m.mode, Mode::CreateVarPrompt(_)),
+            "still prompting after the first var"
+        );
+        assert_eq!(vp(&m).idx, 1, "advanced to the second var");
+        assert_eq!(vp(&m).input, "", "input reset for the next var");
+        assert_eq!(
+            vp(&m).collected,
+            vec![("a".to_string(), "one".to_string())],
+            "first pair stored"
+        );
+        type_str(&mut m, "two");
+        let cmd = update(&mut m, key(Key::Enter));
+        assert_eq!(
+            cmd,
+            Some(Command::CreateWithVars {
+                name: "{a}-{b}".into(),
+                set_vars: vec![("a".into(), "one".into()), ("b".into(), "two".into())],
+            }),
+            "both pairs emitted in template order"
+        );
+        assert_eq!(m.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn create_prompt_empty_entry_skips_that_var() {
+        let mut m = prompt_model("{a}-{b}", &["a", "b"]);
+        // Enter on empty input for 'a' -> skip it.
+        update(&mut m, key(Key::Enter));
+        assert_eq!(vp(&m).idx, 1, "advanced past the skipped var");
+        assert!(
+            vp(&m).collected.is_empty(),
+            "nothing collected for the empty entry"
+        );
+        type_str(&mut m, "bee");
+        let cmd = update(&mut m, key(Key::Enter));
+        assert_eq!(
+            cmd,
+            Some(Command::CreateWithVars {
+                name: "{a}-{b}".into(),
+                set_vars: vec![("b".into(), "bee".into())],
+            }),
+            "only the non-empty var is in the emitted pairs"
+        );
+    }
+
+    #[test]
+    fn create_prompt_all_entries_skipped_emits_empty_pair_list() {
+        // All-skip -> CreateWithVars with set_vars: [] (attach with the
+        // name resolving empty — intentionally today's behavior).
+        let mut m = prompt_model("{a}-{b}", &["a", "b"]);
+        update(&mut m, key(Key::Enter)); // skip a
+        let cmd = update(&mut m, key(Key::Enter)); // skip b
+        assert_eq!(
+            cmd,
+            Some(Command::CreateWithVars {
+                name: "{a}-{b}".into(),
+                set_vars: vec![],
+            }),
+            "all-skip -> CreateWithVars with an empty set_vars list"
+        );
+        assert_eq!(m.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn create_prompt_backspace_edits_input() {
+        let mut m = prompt_model("{a}", &["a"]);
+        type_str(&mut m, "abc");
+        update(&mut m, key(Key::Backspace));
+        assert_eq!(vp(&m).input, "ab", "Backspace removes the last char");
+    }
+
+    #[test]
+    fn create_prompt_accepts_spaces() {
+        // Values may hold spaces (unlike session names) — the prompt keeps
+        // them, mirroring shperl's 0x20..=0x7e printable rule.
+        let mut m = prompt_model("{a}", &["a"]);
+        type_str(&mut m, "key bugfix");
+        assert_eq!(vp(&m).input, "key bugfix");
+    }
+
+    #[test]
+    fn create_prompt_esc_cancels_nothing_collected() {
+        let mut m = prompt_model("{a}-{b}", &["a", "b"]);
+        type_str(&mut m, "partial");
+        // Esc cancels: returns to Normal (which then auto-refreshes, like
+        // the CreateInput Esc path), prompt torn down, nothing set.
+        let cmd = update(&mut m, key(Key::Esc));
+        assert_eq!(cmd, Some(Command::Refresh));
+        assert_eq!(m.mode, Mode::Normal, "Esc returns to Normal mode");
+    }
+
+    #[test]
+    fn create_prompt_ctrl_c_cancels_like_esc() {
+        let mut m = prompt_model("{a}", &["a"]);
+        let cmd = update(&mut m, key(Key::Ctrl(0x03)));
+        assert_eq!(cmd, Some(Command::Refresh), "Ctrl-C cancels to Normal");
+        assert_eq!(m.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn create_prompt_arrow_keys_ignored() {
+        let mut m = prompt_model("{a}", &["a"]);
+        update(&mut m, key(Key::Down));
+        update(&mut m, key(Key::Up));
+        assert_eq!(vp(&m).input, "", "CSI/arrow keys are not typed into input");
+        assert_eq!(vp(&m).idx, 0, "still on the first var");
+    }
+
+    #[test]
+    fn create_prompt_keystroke_does_not_auto_refresh() {
+        // The Normal-only auto-refresh must not fire mid-prompt: typing a
+        // value isn't a list-storm trigger.
+        let mut m = prompt_model("{a}", &["a"]);
+        assert_eq!(update(&mut m, key(Key::Char(b'x'))), None);
+        // A non-final Enter (skip) also produces no command.
+        let mut m2 = prompt_model("{a}-{b}", &["a", "b"]);
+        assert_eq!(update(&mut m2, key(Key::Enter)), None);
+    }
+
+    #[test]
+    fn create_vars_failed_parks_error_in_normal_mode() {
+        // The apply step failed on a var; the prompt already dropped to
+        // Normal (B.4), so the parked error is visible (not hidden behind
+        // a modal). Message names the failed var.
+        let mut m = Model::new(vec![]);
+        // Mode is Normal by the time CreateVarsFailed lands (B.4 dropped to
+        // it at apply-emit).
+        let cmd = update(
+            &mut m,
+            Event::CreateVarsFailed {
+                var: "b".into(),
+                err: Some("not allowed".into()),
+            },
+        );
+        assert_eq!(cmd, None);
+        assert_eq!(m.mode, Mode::Normal, "error surfaces in Normal mode");
+        assert_eq!(m.error.as_deref(), Some("var set b: not allowed"));
+    }
+
+    #[test]
+    fn create_vars_failed_without_stderr_uses_generic() {
+        let mut m = Model::new(vec![]);
+        update(
+            &mut m,
+            Event::CreateVarsFailed {
+                var: "b".into(),
+                err: Option::None,
+            },
+        );
+        assert_eq!(m.error.as_deref(), Some("var set b failed"));
+    }
+
+    #[test]
+    fn mid_prompt_session_refresh_leaves_prompt_intact() {
+        // A background refresh (events/focus) during the prompt only
+        // touches the session list — mode and VarPromptState survive.
+        let mut m = prompt_model("{a}-x", &["a"]);
+        type_str(&mut m, "half");
+        update(&mut m, Event::SessionsRefreshed(vec![mk("other")]));
+        assert!(
+            matches!(m.mode, Mode::CreateVarPrompt(_)),
+            "still in the prompt after a refresh"
+        );
+        assert_eq!(vp(&m).input, "half", "the in-progress input survives");
+        assert_eq!(vp(&m).idx, 0, "prompt position unchanged");
+    }
+
+    #[test]
+    fn create_prompt_first_keystroke_clears_parked_error() {
+        // The existing keystroke-clears-error rule covers the prompt — a
+        // parked error is dismissed on the first prompt keystroke, and no
+        // second clear is needed in the handler.
+        let mut m = prompt_model("{a}", &["a"]);
+        m.set_error("stale background error");
+        update(&mut m, key(Key::Char(b'x')));
+        assert!(m.error.is_none(), "first keystroke cleared the error");
+    }
+
+    #[test]
+    fn create_all_known_never_reaches_prompt() {
+        // When every referenced var is set, the detect step (in the
+        // executor) finds no unknowns and never emits CreateNeedsVars, so
+        // update never opens the prompt. This asserts the pure helper the
+        // detect step relies on returns empty for an all-known name; the
+        // executor's branch is exercised by the detect logic in main.rs.
+        use super::super::template::unknown_template_vars;
+        let known: std::collections::HashSet<&str> = ["a", "b"].into_iter().collect();
+        assert!(
+            unknown_template_vars("{a}-{b}", &known).is_empty(),
+            "all-known name -> no unknowns -> detect falls through to attach"
+        );
     }
 }

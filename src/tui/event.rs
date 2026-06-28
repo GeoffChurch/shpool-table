@@ -48,6 +48,27 @@ pub enum Event {
         err: Option<String>,
     },
 
+    /// The Create detect step found template vars the new session's name
+    /// references but `var list` doesn't carry. `vars` is those unknowns
+    /// in `template_vars` order; `set_vars` is the `(name, value)` pairs
+    /// `var list` *did* carry, carried through so the prompt's live name
+    /// preview can resolve the known co-vars (shperl stashes the same
+    /// set-map on its `var_prompt`). `update` opens the create-var prompt
+    /// on them. Emitted from the top of the Create executor, before any
+    /// teardown — the prompt runs in the still-up alt-screen.
+    CreateNeedsVars {
+        name: String,
+        vars: Vec<String>,
+        set_vars: Vec<(String, String)>,
+    },
+
+    /// A `shpool var set` in the CreateWithVars apply step failed: the
+    /// create is aborted with no attach. `var` is the variable whose set
+    /// failed; `err` is its raw stderr if any. `update` parks the error
+    /// (the prompt already dropped to Normal at apply-emit, so it
+    /// surfaces), formatted like the vars view's `var set <var>: <err>`.
+    CreateVarsFailed { var: String, err: Option<String> },
+
     /// `shpool var list` returned a fresh variable list. `update` opens
     /// the vars view on it and emits no Command.
     VarsFetched(Vec<Var>),

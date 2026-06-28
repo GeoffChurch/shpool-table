@@ -1,0 +1,11 @@
+---
+source: src/tui/view.rs
+expression: "render_visible(&m, 72, 12)"
+---
+                             variables (2)                              
+ > editor    = vim   (1 session)                                        
+   workspace   (unset)   (1 session)
+
+  {editor} attachments:
+    {editor}-notes           vim-notes        pid 333
+  j/k: select, e: set value, esc: back

@@ -1,12 +1,11 @@
-use std::collections::HashMap;
 use std::io::{self, Write};
 
 use super::keymap::{
     CONFIRM_FORCE_HINTS, CONFIRM_KILL_HINTS, CREATE_HINTS, NORMAL_BINDINGS, VARS_BROWSE_HINTS,
     VARS_EDIT_HINTS,
 };
-use super::model::{Mode, Model, VarsState};
-use super::template::{attachments_for_var, resolve_template};
+use super::model::{Mode, Model, Var, VarPromptState, VarsState, resolution_map};
+use super::template::{attachments_for_var, filter_rank, resolve_template};
 use crate::session::Session;
 
 // SGR codes for the bar chrome. The chrome reads as a phosphor-amber
@@ -88,6 +87,48 @@ fn error_label(msg: &str) -> Label {
     let mut l = Label::default();
     l.push_error("! ");
     l.push_error(msg);
+    l
+}
+
+/// Create-time variable prompt bottom bar: which var is being asked for,
+/// the value typed so far, and a live preview of the session name as it
+/// resolves under the values entered so far. The preview map is the
+/// already-set vars, plus every value collected on prior prompts, plus the
+/// current var bound to the in-progress input. Vars still to be prompted
+/// are deliberately left out of the map so `resolve_template` renders them
+/// as the literal `{name}` — folding them in empty would collapse a
+/// `{future}-x` template to `-x`, mis-previewing the eventual name (the
+/// same trap A.1 guards against). The hint reads `ret: next` until the
+/// last var, then `ret: create`.
+fn create_vars_label(vp: &VarPromptState) -> Label {
+    let var = &vp.vars[vp.idx];
+
+    // Build the resolution map: set vars, then collected pairs, then the
+    // current var -> in-progress input. Future-unknown vars are omitted.
+    let mut map: std::collections::HashMap<&str, &str> = vp
+        .set_vars
+        .iter()
+        .map(|(n, v)| (n.as_str(), v.as_str()))
+        .collect();
+    for (n, v) in &vp.collected {
+        map.insert(n.as_str(), v.as_str());
+    }
+    map.insert(var.as_str(), vp.input.as_str());
+    let preview = resolve_template(&vp.name, &map);
+
+    let last = vp.idx == vp.vars.len() - 1;
+    let ret_desc = if last { "create" } else { "next" };
+
+    let mut l = Label::default();
+    l.push_plain("set value for ");
+    l.push_key(var);
+    l.push_plain(": ");
+    l.push_key(&vp.input);
+    l.push_plain("_   ");
+    l.push_plain(&preview);
+    l.push_plain("   (");
+    push_hints(&mut l, &[("ret", ret_desc), ("esc", "cancel")]);
+    l.push_plain(")");
     l
 }
 
@@ -304,9 +345,11 @@ pub fn render(
     // draws here.
     match &model.mode {
         Mode::Vars(vs) => render_vars(out, w, height as usize, vs, &model.sessions, &model.error),
-        Mode::Normal | Mode::CreateInput(_) | Mode::ConfirmKill(_) | Mode::ConfirmForce(_) => {
-            render_session_screen(model, w, height, now_ms, out)
-        }
+        Mode::Normal
+        | Mode::CreateInput(_)
+        | Mode::CreateVarPrompt(_)
+        | Mode::ConfirmKill(_)
+        | Mode::ConfirmForce(_) => render_session_screen(model, w, height, now_ms, out),
     }
 }
 
@@ -409,6 +452,9 @@ fn render_vars(
 ) -> io::Result<()> {
     render_bar(out, w, &vars_title_label(vs), BarAlign::Center)?;
 
+    // Title bar + bottom bar; the body top-clips into whatever's left.
+    let body_rows = height.saturating_sub(2);
+
     // Each body line is (visible text, whether to reverse-video it).
     let mut lines: Vec<(String, bool)> = Vec::new();
     if vs.vars.is_empty() {
@@ -417,66 +463,34 @@ fn render_vars(
             false,
         ));
     } else {
-        // Name column grows to the widest variable name.
-        let nw = vs.vars.iter().map(|v| v.name.len()).max().unwrap_or(0);
-        for (i, v) in vs.vars.iter().enumerate() {
-            let is_selected = i == vs.selected;
-            let arrow = if is_selected { '>' } else { ' ' };
-            let count = attachments_for_var(sessions, &v.name).len();
-            let row = clip(
-                &format!(
-                    " {arrow} {name:<nw$} = {value}   ({count} session{plural})",
-                    name = v.name,
-                    value = v.value,
-                    plural = if count == 1 { "" } else { "s" },
-                ),
-                w,
-            );
-            lines.push((row, is_selected));
-        }
+        lines.extend(vars_list_lines(vs, sessions, w));
 
-        // Build the resolve map from the current values; while editing,
-        // override the selected variable with the in-progress buffer so
-        // each governed row shows its prospective re-dial target.
-        let mut vmap: HashMap<&str, &str> = vs
-            .vars
-            .iter()
-            .map(|v| (v.name.as_str(), v.value.as_str()))
-            .collect();
         let sel = &vs.vars[vs.selected];
-        if let Some(buf) = &vs.edit {
-            vmap.insert(sel.name.as_str(), buf.as_str());
-        }
-
-        let hits = attachments_for_var(sessions, &sel.name);
-        lines.push((String::new(), false));
-        if hits.is_empty() {
-            lines.push((
-                "  (no attachments reference this variable)".to_string(),
-                false,
-            ));
+        if let Some(edit) = &vs.edit {
+            // Layout C: variable list, then the windowed candidate list,
+            // then the re-dial preview pointed at the highlighted candidate
+            // (or, when nothing matches the filter, the literal field).
+            // Window the candidate list into whatever rows the variable
+            // list + preview block leave free, so the preview is never
+            // crowded out; the body still top-clips as a backstop.
+            let shown = filter_rank(&edit.candidates, &edit.filter);
+            let target: &str = shown
+                .get(edit.highlight)
+                .map_or(&edit.field, |s| s.as_str());
+            let preview = vars_preview_lines(sel, &vs.vars, sessions, Some(target), w);
+            let reserved = lines.len()      // variable list
+                + 1                          // candidate header
+                + preview.len(); // blank + preview block
+            let rows = body_rows.saturating_sub(reserved).max(3); // small floor; clip backstops
+            lines.extend(vars_cand_lines(&shown, edit.highlight, rows, w));
+            lines.extend(preview);
         } else {
-            lines.push((format!("  {{{name}}} attachments:", name = sel.name), false));
-            for a in &hits {
-                let mut row = format!(
-                    "    {tmpl:<24} {sess:<16} pid {pid}",
-                    tmpl = a.template,
-                    sess = a.session,
-                    pid = a.pid,
-                );
-                if vs.edit.is_some() {
-                    let after = resolve_template(a.template, &vmap);
-                    if after != a.session {
-                        row.push_str(&format!("  -> {after}"));
-                    }
-                }
-                lines.push((clip(&row, w), false));
-            }
+            // Browsing: resolve the preview against current values.
+            lines.extend(vars_preview_lines(sel, &vs.vars, sessions, None, w));
         }
     }
 
     // Top-clip the body to the rows between the two bars.
-    let body_rows = height.saturating_sub(2);
     for (text, selected) in lines.into_iter().take(body_rows) {
         if selected {
             write!(out, "{SGR_SELECTED}{text:<w$}{SGR_RESET}\r\n")?;
@@ -489,6 +503,131 @@ fn render_vars(
     Ok(())
 }
 
+/// The variable list: one row per variable, the selected row marked and
+/// flagged for reverse-video, each annotated with how many attachments it
+/// governs. An unset row — a variable a template references but `var list`
+/// doesn't carry — drops the `= value` for a dimmed `(unset)` in the value
+/// column; setting it (e/Enter) creates the variable.
+fn vars_list_lines(vs: &VarsState, sessions: &[Session], w: usize) -> Vec<(String, bool)> {
+    let nw = vs.vars.iter().map(|v| v.name.len()).max().unwrap_or(0);
+    vs.vars
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let is_selected = i == vs.selected;
+            let arrow = if is_selected { '>' } else { ' ' };
+            let count = attachments_for_var(sessions, &v.name).len();
+            let tail = format!("   ({count} session{})", if count == 1 { "" } else { "s" });
+            // Width/clip accounting stays on plain text (matching shperl);
+            // the dim is injected afterward as a zero-width substitution.
+            let row = clip(
+                &if v.unset {
+                    format!(" {arrow} {name:<nw$}   (unset){tail}", name = v.name)
+                } else {
+                    format!(
+                        " {arrow} {name:<nw$} = {value}{tail}",
+                        name = v.name,
+                        value = v.value
+                    )
+                },
+                w,
+            );
+            if !v.unset {
+                return (row, is_selected);
+            }
+            // Dim the `(unset)` marker as a zero-width substitution on the
+            // plain row. On a selected row, render_vars wraps the text in
+            // reverse-video and pads it with `{:<w$}` (a byte-count pad), so
+            // pre-pad the plain text to `w` here — before injecting the
+            // SGR — so that pad becomes a no-op, then re-assert reverse-video
+            // after the marker's reset so the dim doesn't bleed into the
+            // rest of the row. A non-selected row is written verbatim (no
+            // pad), so leave it unpadded, matching the set rows beside it.
+            let base = if is_selected {
+                format!("{row:<w$}")
+            } else {
+                row
+            };
+            let reassert = if is_selected { SGR_SELECTED } else { "" };
+            let dimmed = format!("{SGR_AMBER_DIM}(unset){SGR_RESET}{reassert}");
+            (base.replacen("(unset)", &dimmed, 1), is_selected)
+        })
+        .collect()
+}
+
+/// The candidate list while editing: a header plus the visible window of
+/// `shown` (sized to `rows` around `highlight` via the shared viewport
+/// helper), the highlighted row marked and flagged for reverse-video.
+fn vars_cand_lines(
+    shown: &[String],
+    highlight: usize,
+    rows: usize,
+    w: usize,
+) -> Vec<(String, bool)> {
+    let mut lines = vec![("  candidate values:".to_string(), false)];
+    if shown.is_empty() {
+        lines.push(("    (no matching session names)".to_string(), false));
+        return lines;
+    }
+    let rows = rows.max(1);
+    let (start, end) = viewport(shown.len(), highlight, rows);
+    for (i, cand) in shown[start..end].iter().enumerate() {
+        let abs_i = start + i;
+        let is_highlight = abs_i == highlight;
+        let arrow = if is_highlight { '>' } else { ' ' };
+        let row = clip(&format!(" {arrow} {cand}"), w);
+        lines.push((row, is_highlight));
+    }
+    lines
+}
+
+/// The re-dial preview: one line per attachment the selected variable
+/// governs, under the `  {V} attachments:` header. With `target` set
+/// (editing), each row shows `-> resolved` for the prospective value when
+/// it differs from the current session. A leading blank separates the
+/// block from whatever precedes it.
+fn vars_preview_lines(
+    sel: &Var,
+    vars: &[Var],
+    sessions: &[Session],
+    target: Option<&str>,
+    w: usize,
+) -> Vec<(String, bool)> {
+    // Map from real (!unset) rows only: a synthetic unset co-var must
+    // stay literal in the preview, not collapse a `{name}` to empty.
+    let mut vmap = resolution_map(vars);
+    if let Some(t) = target {
+        vmap.insert(sel.name.as_str(), t);
+    }
+
+    let hits = attachments_for_var(sessions, &sel.name);
+    let mut lines = vec![(String::new(), false)];
+    if hits.is_empty() {
+        lines.push((
+            "  (no attachments reference this variable)".to_string(),
+            false,
+        ));
+        return lines;
+    }
+    lines.push((format!("  {{{name}}} attachments:", name = sel.name), false));
+    for a in &hits {
+        let mut row = format!(
+            "    {tmpl:<24} {sess:<16} pid {pid}",
+            tmpl = a.template,
+            sess = a.session,
+            pid = a.pid,
+        );
+        if target.is_some() {
+            let after = resolve_template(a.template, &vmap);
+            if after != a.session {
+                row.push_str(&format!("  -> {after}"));
+            }
+        }
+        lines.push((clip(&row, w), false));
+    }
+    lines
+}
+
 fn vars_title_label(vs: &VarsState) -> Label {
     let mut l = Label::default();
     l.push_key(&format!("variables ({})", vs.vars.len()));
@@ -498,14 +637,14 @@ fn vars_title_label(vs: &VarsState) -> Label {
 /// Vars-view bottom bar. The value-entry line outranks an error (same
 /// rule as the session view's modals); otherwise the key hints.
 fn vars_bottom_label(vs: &VarsState, error: &Option<String>) -> Label {
-    if let Some(buf) = &vs.edit {
+    if let Some(edit) = &vs.edit {
         let mut l = Label::default();
         l.push_plain("set ");
         if let Some(v) = vs.vars.get(vs.selected) {
             l.push_key(&v.name);
         }
         l.push_plain(" = ");
-        l.push_key(buf);
+        l.push_key(&edit.field);
         l.push_plain("_   (");
         push_hints(&mut l, VARS_EDIT_HINTS);
         l.push_plain(")");
@@ -531,6 +670,7 @@ fn vars_bottom_label(vs: &VarsState, error: &Option<String>) -> Label {
 fn bottom_bar_label(model: &Model) -> Label {
     match &model.mode {
         Mode::CreateInput(input) => create_input_label(input),
+        Mode::CreateVarPrompt(vp) => create_vars_label(vp),
         Mode::ConfirmKill(name) => confirm_kill_label(name),
         Mode::ConfirmForce(name) => confirm_force_label(name),
         // The vars view renders its own bar in render_vars; this arm is
@@ -763,7 +903,18 @@ mod tests {
     // -- vars view --
 
     use crate::session::Attachment;
-    use crate::tui::model::{Var, VarsState};
+    use crate::tui::model::{EditState, Var, VarsState};
+
+    fn detached_sess(name: &str) -> Session {
+        Session {
+            name: name.to_string(),
+            attached: false,
+            started_at_unix_ms: NOW_MS,
+            last_connected_at_unix_ms: NOW_MS,
+            last_disconnected_at_unix_ms: None,
+            attachments: Vec::new(),
+        }
+    }
 
     fn attached_sess(name: &str, template: &str, pid: u64) -> Session {
         Session {
@@ -782,7 +933,7 @@ mod tests {
     /// A model in the vars view: two variables, plus attached sessions
     /// dialed in with `{workspace}-...` templates so the `workspace`
     /// variable governs two attachments.
-    fn vars_view_model(selected: usize, edit: Option<&str>) -> Model {
+    fn vars_view_model(selected: usize, edit: Option<EditState>) -> Model {
         let mut m = Model::new(vec![
             attached_sess("myproj-edit", "{workspace}-edit", 111),
             attached_sess("myproj-term", "{workspace}-term", 222),
@@ -793,14 +944,16 @@ mod tests {
                 Var {
                     name: "editor".into(),
                     value: "vim".into(),
+                    unset: false,
                 },
                 Var {
                     name: "workspace".into(),
                     value: "myproj".into(),
+                    unset: false,
                 },
             ],
             selected,
-            edit: edit.map(|s| s.to_string()),
+            edit,
         });
         m
     }
@@ -816,11 +969,72 @@ mod tests {
 
     #[test]
     fn vars_view_editing_shows_prospective_target() {
-        // Editing `workspace` to "newproj": the value-entry bar shows,
-        // and each governed attachment shows its prospective re-dial
-        // target via `->`.
-        let m = vars_view_model(1, Some("newproj"));
-        insta::assert_snapshot!(render_visible(&m, 72, 10));
+        // Layout C, editing `workspace`: the variable list, the windowed
+        // candidate list with the highlighted row marked, then the
+        // highlighted candidate's per-attachment re-dial preview. The
+        // value-selector bar shows `set workspace = demo_`. Mirrors
+        // shperl's editing golden: a 4th detached session (demo-edit)
+        // makes `demo` a candidate; the highlight sits on it (as if the
+        // user arrowed down once), so the field is `demo` and each
+        // governed row re-dials via `->`.
+        let mut m = Model::new(vec![
+            attached_sess("myproj-edit", "{workspace}-edit", 111),
+            attached_sess("myproj-term", "{workspace}-term", 222),
+            attached_sess("vim-notes", "{editor}-notes", 333),
+            detached_sess("demo-edit"),
+        ]);
+        m.mode = Mode::Vars(VarsState {
+            vars: vec![
+                Var {
+                    name: "editor".into(),
+                    value: "vim".into(),
+                    unset: false,
+                },
+                Var {
+                    name: "workspace".into(),
+                    value: "myproj".into(),
+                    unset: false,
+                },
+            ],
+            selected: 1,
+            edit: Some(EditState {
+                field: "demo".into(),
+                filter: String::new(),
+                candidates: vec!["myproj".into(), "demo".into()],
+                highlight: 1,
+            }),
+        });
+        insta::assert_snapshot!(render_visible(&m, 72, 14));
+    }
+
+    #[test]
+    fn vars_view_unset_row() {
+        // editor is set and referenced (its preview is the rendered one);
+        // workspace is referenced by an attached template but absent from
+        // `var list`, so it surfaces as a dimmed (unset) row with its own
+        // session count. ASCII names — the name column is byte-measured.
+        // Mirrors shperl's `vars view with an unset row beside a set row`
+        // golden.
+        use crate::tui::model::merge_unset_vars;
+        let sessions = vec![
+            attached_sess("vim-notes", "{editor}-notes", 333),
+            attached_sess("myproj-edit", "{workspace}-edit", 111),
+        ];
+        let vars = merge_unset_vars(
+            &[Var {
+                name: "editor".into(),
+                value: "vim".into(),
+                unset: false,
+            }],
+            &sessions,
+        );
+        let mut m = Model::new(sessions);
+        m.mode = Mode::Vars(VarsState {
+            vars,
+            selected: 0, // editor (set), sorts first
+            edit: None,
+        });
+        insta::assert_snapshot!(render_visible(&m, 72, 12));
     }
 
     #[test]
@@ -844,9 +1058,15 @@ mod tests {
             vars: vec![Var {
                 name: "editor".into(),
                 value: "vim".into(),
+                unset: false,
             }],
             selected: 0,
-            edit: Some("nano".into()),
+            edit: Some(EditState {
+                field: "nano".into(),
+                filter: "nano".into(),
+                candidates: vec!["nano".into()],
+                highlight: 0,
+            }),
         };
         let err = Some("boom".to_string());
         let label = strip_ansi(&vars_bottom_label(&vs, &err).styled);
@@ -860,6 +1080,7 @@ mod tests {
             vars: vec![Var {
                 name: "editor".into(),
                 value: "vim".into(),
+                unset: false,
             }],
             selected: 0,
             edit: None,
@@ -867,5 +1088,109 @@ mod tests {
         let err = Some("var set editor: nope".to_string());
         let label = strip_ansi(&vars_bottom_label(&vs, &err).styled);
         assert!(label.contains("var set editor: nope"), "got: {label:?}");
+    }
+
+    // -- Feature B: create-time variable prompt bottom bar --
+
+    fn vp(
+        name: &str,
+        vars: &[&str],
+        idx: usize,
+        input: &str,
+        collected: &[(&str, &str)],
+        set_vars: &[(&str, &str)],
+    ) -> VarPromptState {
+        VarPromptState {
+            name: name.to_string(),
+            vars: vars.iter().map(|s| s.to_string()).collect(),
+            idx,
+            input: input.to_string(),
+            collected: collected
+                .iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect(),
+            set_vars: set_vars
+                .iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn create_vars_label_shows_var_input_and_live_preview() {
+        // On the first var, the current var resolves to the input; the
+        // future var {b} stays literal (not collapsed to empty). The hint
+        // reads "next" while more vars remain. Matches shperl's line:
+        //   set value for a: foo_   foo-{b}   (ret: next, esc: cancel)
+        let state = vp("{a}-{b}", &["a", "b"], 0, "foo", &[], &[]);
+        let label = strip_ansi(&create_vars_label(&state).styled);
+        assert_eq!(
+            label, "set value for a: foo_   foo-{b}   (ret: next, esc: cancel)",
+            "got: {label:?}"
+        );
+    }
+
+    #[test]
+    fn create_vars_label_future_var_never_collapsed_to_empty() {
+        // The {b} token must survive literally on the first var — folding
+        // it in empty would mis-preview "foo-" for "{a}-{b}".
+        let state = vp("{a}-{b}", &["a", "b"], 0, "foo", &[], &[]);
+        let label = strip_ansi(&create_vars_label(&state).styled);
+        assert!(label.contains("foo-{b}"), "got: {label:?}");
+        assert!(
+            !label.contains("foo-   "),
+            "no empty-collapsed 'foo-' preview: {label:?}"
+        );
+    }
+
+    #[test]
+    fn create_vars_label_collected_and_set_vars_feed_preview_last_says_create() {
+        // Asking for the final var 'b'; 'a' was collected as "ay" and 'c'
+        // is a pre-set var. The preview resolves all three, and the hint
+        // reads "create" on the last var. Matches shperl's line:
+        //   set value for b: bee_   ay-bee-see   (ret: create, esc: cancel)
+        let state = vp(
+            "{a}-{b}-{c}",
+            &["a", "b"],
+            1,
+            "bee",
+            &[("a", "ay")],
+            &[("c", "see")],
+        );
+        let label = strip_ansi(&create_vars_label(&state).styled);
+        assert_eq!(
+            label, "set value for b: bee_   ay-bee-see   (ret: create, esc: cancel)",
+            "got: {label:?}"
+        );
+    }
+
+    #[test]
+    fn create_vars_prompt_outranks_error_in_bottom_bar() {
+        // The prompt label outranks a parked error (modal-over-error),
+        // matching the session view's other modals.
+        let mut m = Model::new(vec![sess("foo", false, NOW_MS)]);
+        m.mode = Mode::CreateVarPrompt(vp("{a}-x", &["a"], 0, "typing", &[], &[]));
+        m.set_error("background error msg");
+        let label = strip_ansi(&bottom_bar_label(&m).styled);
+        assert!(label.contains("set value for a:"), "got: {label:?}");
+        assert!(label.contains("typing"), "got: {label:?}");
+        assert!(!label.contains("background error msg"), "got: {label:?}");
+    }
+
+    #[test]
+    fn create_vars_prompt_renders_over_session_list_hiding_error() {
+        // The prompt renders in the bottom bar over the session list; a
+        // parked error stays hidden behind it.
+        let mut m = Model::new(vec![sess("foo", false, NOW_MS)]);
+        m.mode = Mode::CreateVarPrompt(vp("{a}-x", &["a"], 0, "wsname", &[], &[]));
+        m.set_error("session 'foo' is gone");
+        let out = render_visible(&m, 80, 8);
+        assert!(out.contains("set value for a:"), "prompt shown: {out:?}");
+        assert!(out.contains("wsname"), "typed input visible: {out:?}");
+        assert!(out.contains("foo"), "session list still rendered: {out:?}");
+        assert!(
+            !out.contains("is gone"),
+            "error not shown over prompt: {out:?}"
+        );
     }
 }

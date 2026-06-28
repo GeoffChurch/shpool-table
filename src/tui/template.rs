@@ -84,6 +84,21 @@ pub fn template_vars(tmpl: &str) -> Vec<String> {
     names
 }
 
+/// Variables a template references that aren't in `known` — the names a
+/// create-time prompt has to ask for. `template_vars(name)` minus the
+/// `known` set, first-seen order preserved (so the prompt walks them in
+/// the order they appear in the name). Pure and `Var`-free, like
+/// `template_vars`; the caller supplies the set of already-known names
+/// (the keys of the resolution map). A var set to the empty string still
+/// counts as known — membership, not truthiness — so it is never
+/// re-prompted.
+pub fn unknown_template_vars(name: &str, known: &std::collections::HashSet<&str>) -> Vec<String> {
+    template_vars(name)
+        .into_iter()
+        .filter(|n| !known.contains(n.as_str()))
+        .collect()
+}
+
 /// Resolve a template against a `name -> value` map: each `{name}`
 /// becomes its value; an unknown name is left as the literal `{name}`.
 pub fn resolve_template(tmpl: &str, vars: &HashMap<&str, &str>) -> String {
@@ -137,6 +152,163 @@ pub fn attachments_for_var<'a>(sessions: &'a [Session], var: &str) -> Vec<Govern
     hits
 }
 
+/// Candidate values for `target`: values that, substituted for `target`
+/// (the other variables pinned to their current values in `vars`), make
+/// one of `target`'s templates resolve to a session name that currently
+/// exists. `vars` is the `name -> value` map `resolve_template` consumes.
+///
+/// Templates come only from currently-attached sessions (`attachments`),
+/// but the match scans ALL session names — a detached session still
+/// exists by name and is a valid re-dial target. The capture is a
+/// prefix/suffix strip (`strip_prefix`/`strip_suffix`, char-safe and
+/// never panicking), so it's correct on multibyte names. Returns the
+/// current value first, then the harvested captures, de-duplicated.
+pub fn candidate_values(
+    sessions: &[Session],
+    vars: &HashMap<&str, &str>,
+    target: &str,
+) -> Vec<String> {
+    let current = vars.get(target).copied().unwrap_or("").to_string();
+
+    // Distinct templates (from attachments) that mention {target}.
+    let mut templates: Vec<&str> = Vec::new();
+    for s in sessions {
+        for a in &s.attachments {
+            let tmpl = a.session_name_template.as_str();
+            if template_vars(tmpl).iter().any(|n| n == target) && !templates.contains(&tmpl) {
+                templates.push(tmpl);
+            }
+        }
+    }
+
+    let mut cands: Vec<String> = vec![current.clone()];
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    seen.insert(current);
+
+    for tmpl in templates {
+        // Locate the single {target} token among the scanned segments;
+        // skip the template if it appears zero or 2+ times. Pin every
+        // other token to its current value (unknown co-var stays literal
+        // {name}, per resolve_template), collapsing T to
+        // prefix + {target} + suffix.
+        let segments = scan_template(tmpl);
+        let target_count = segments
+            .iter()
+            .filter(|seg| matches!(seg, Segment::Token(name) if *name == target))
+            .count();
+        if target_count != 1 {
+            continue;
+        }
+        let mut prefix = String::new();
+        let mut suffix = String::new();
+        let mut seen_target = false;
+        for seg in &segments {
+            let into = if seen_target {
+                &mut suffix
+            } else {
+                &mut prefix
+            };
+            match seg {
+                Segment::Literal(lit) => into.push_str(lit),
+                Segment::Token(name) if *name == target => seen_target = true,
+                Segment::Token(name) => match vars.get(name) {
+                    Some(value) => into.push_str(value),
+                    None => {
+                        into.push('{');
+                        into.push_str(name);
+                        into.push('}');
+                    }
+                },
+            }
+        }
+
+        for s in sessions {
+            // Strip the prefix off the front and the suffix off the back;
+            // the remainder is the captured value. strip_* is char-safe
+            // and won't panic on a multibyte boundary.
+            let Some(rest) = s.name.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Some(cap) = rest.strip_suffix(&suffix) else {
+                continue;
+            };
+            if cap.is_empty() {
+                continue; // empty capture dropped
+            }
+            if seen.insert(cap.to_string()) {
+                cands.push(cap.to_string());
+            }
+        }
+    }
+    cands
+}
+
+/// ASCII-lowercase a string: `A`–`Z` fold to `a`–`z`, every other byte
+/// (including multibyte UTF-8) is left untouched. Matches shperl's
+/// `tr/A-Z/a-z/`, so folding is identical across the two ports.
+fn ascii_fold(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_uppercase() {
+                c.to_ascii_lowercase()
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// Filter + rank `candidates` against `query`. Keep candidates whose
+/// ASCII-folded form has the ASCII-folded query as a subsequence; order
+/// by a total key: (1) exact match, (2) contiguous (folded candidate
+/// *contains* folded query) before scattered, (3) earliest first-match
+/// char index, (4) fewer characters (`chars().count()`), (5) harvest
+/// index. An empty query keeps everything in harvest order. All
+/// comparisons are on folded character forms, so the ranking is
+/// identical regardless of byte width.
+pub fn filter_rank(candidates: &[String], query: &str) -> Vec<String> {
+    if query.is_empty() {
+        return candidates.to_vec();
+    }
+
+    let folded_query = ascii_fold(query);
+    let query_chars: Vec<char> = folded_query.chars().collect();
+    let first_query = query_chars[0];
+
+    // The total-order sort key from the doc, in priority order: exact
+    // match, contiguous-before-scattered, earliest first-match char
+    // index, fewer characters, harvest index.
+    type RankKey = (u8, u8, usize, usize, usize);
+
+    let mut ranked: Vec<(RankKey, &String)> = Vec::new();
+    for (i, cand) in candidates.iter().enumerate() {
+        let folded: Vec<char> = ascii_fold(cand).chars().collect();
+
+        // Subsequence test on folded chars; also record the index of the
+        // first candidate char equal to the first query char.
+        let mut first = usize::MAX;
+        let mut qi = 0usize;
+        for (ci, &fc) in folded.iter().enumerate() {
+            if first == usize::MAX && fc == first_query {
+                first = ci;
+            }
+            if qi < query_chars.len() && fc == query_chars[qi] {
+                qi += 1;
+            }
+        }
+        if qi != query_chars.len() {
+            continue; // not a subsequence
+        }
+
+        let folded_str: String = folded.iter().collect();
+        let exact = u8::from(folded_str != folded_query);
+        let contiguous = u8::from(!folded_str.contains(&folded_query));
+        ranked.push(((exact, contiguous, first, folded.len(), i), cand));
+    }
+    ranked.sort_by_key(|(key, _)| *key);
+    ranked.into_iter().map(|(_, c)| c.clone()).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,6 +319,56 @@ mod tests {
         assert_eq!(template_vars("{workspace}-edit"), vec!["workspace"]);
         assert_eq!(template_vars("{a}-{b}-{a}"), vec!["a", "b"]);
         assert_eq!(template_vars("plainsess"), Vec::<String>::new());
+    }
+
+    /// Build a `known` set from a slice of names, for
+    /// `unknown_template_vars`.
+    fn known<'a>(names: &[&'a str]) -> std::collections::HashSet<&'a str> {
+        names.iter().copied().collect()
+    }
+
+    #[test]
+    fn unknown_template_vars_tokens_minus_known_order_preserved() {
+        // Ports shperl's `unknown_template_vars` subtest: 0/1/many tokens,
+        // some/all known, repeated, order.
+        assert_eq!(
+            unknown_template_vars("plainsess", &known(&[])),
+            Vec::<String>::new(),
+            "no tokens -> nothing unknown"
+        );
+        assert_eq!(
+            unknown_template_vars("{a}-x", &known(&[])),
+            vec!["a"],
+            "one token, none known"
+        );
+        assert_eq!(
+            unknown_template_vars("{a}-{b}-{c}", &known(&[])),
+            vec!["a", "b", "c"],
+            "many tokens, first-seen order"
+        );
+        assert_eq!(
+            unknown_template_vars("{a}-{b}-{c}", &known(&["b"])),
+            vec!["a", "c"],
+            "a known middle var is dropped, the rest keep order"
+        );
+        assert_eq!(
+            unknown_template_vars("{a}-{b}", &known(&["a", "b"])),
+            Vec::<String>::new(),
+            "all known -> nothing to prompt"
+        );
+        assert_eq!(
+            unknown_template_vars("{a}-{b}-{a}", &known(&[])),
+            vec!["a", "b"],
+            "a repeated token is de-duped (template_vars order)"
+        );
+        // A var set to the empty string still counts as known
+        // (membership, not truthiness) — must not be re-prompted. The
+        // detect-time set carries the name regardless of its value.
+        assert_eq!(
+            unknown_template_vars("{a}-x", &known(&["a"])),
+            Vec::<String>::new(),
+            "a set-but-empty var is known, not prompted"
+        );
     }
 
     #[test]
@@ -197,5 +419,209 @@ mod tests {
         assert_eq!(pids, vec![111, 222]);
         assert_eq!(attachments_for_var(&sessions, "editor").len(), 1);
         assert_eq!(attachments_for_var(&sessions, "nope").len(), 0);
+    }
+
+    // -- candidate_values --
+
+    /// A detached session: exists by name, carries no attachments, so it
+    /// contributes a template to nobody but is still a valid match target.
+    fn detached(name: &str) -> Session {
+        Session {
+            name: name.to_string(),
+            attached: false,
+            started_at_unix_ms: 0,
+            last_connected_at_unix_ms: 0,
+            last_disconnected_at_unix_ms: None,
+            attachments: Vec::new(),
+        }
+    }
+
+    fn vmap<'a>(pairs: &[(&'a str, &'a str)]) -> HashMap<&'a str, &'a str> {
+        pairs.iter().copied().collect()
+    }
+
+    #[test]
+    fn candidate_values_single_template_strips_prefix_suffix() {
+        // demo-edit is detached but still a valid target; noise doesn't
+        // fit the prefix/suffix.
+        let sessions = vec![
+            attached("myproj-edit", "{workspace}-edit", 1),
+            detached("demo-edit"),
+            detached("noise"),
+        ];
+        assert_eq!(
+            candidate_values(&sessions, &vmap(&[("workspace", "myproj")]), "workspace"),
+            vec!["myproj", "demo"],
+        );
+    }
+
+    #[test]
+    fn candidate_values_unions_across_a_variables_templates() {
+        let sessions = vec![
+            attached("a-edit", "{w}-edit", 1),
+            attached("b-term", "{w}-term", 2),
+            detached("c-edit"),
+        ];
+        // Captures unioned across {w}-edit (a, c) then {w}-term (b),
+        // current first.
+        assert_eq!(
+            candidate_values(&sessions, &vmap(&[("w", "a")]), "w"),
+            vec!["a", "c", "b"],
+        );
+    }
+
+    #[test]
+    fn candidate_values_pins_co_vars_to_current_values() {
+        let sessions = vec![
+            attached("vim-myproj-edit", "{editor}-{workspace}-edit", 1),
+            detached("vim-demo-edit"),
+            detached("nano-other-edit"), // editor != vim -> excluded
+        ];
+        assert_eq!(
+            candidate_values(
+                &sessions,
+                &vmap(&[("editor", "vim"), ("workspace", "myproj")]),
+                "workspace",
+            ),
+            vec!["myproj", "demo"],
+        );
+    }
+
+    #[test]
+    fn candidate_values_delimiter_bearing_co_var_pins_literally() {
+        // editor="a-b" makes the pinned prefix "a-b-"; only names with
+        // that exact prefix contribute, on the literal string.
+        let sessions = vec![
+            attached("a-b-myproj", "{editor}-{workspace}", 1),
+            detached("a-b-demo"),
+            detached("a-other"), // prefix "a-b-" mismatch
+        ];
+        assert_eq!(
+            candidate_values(
+                &sessions,
+                &vmap(&[("editor", "a-b"), ("workspace", "myproj")]),
+                "workspace",
+            ),
+            vec!["myproj", "demo"],
+        );
+    }
+
+    #[test]
+    fn candidate_values_bare_token_captures_every_name() {
+        let sessions = vec![
+            attached("alpha", "{x}", 1),
+            detached("beta"),
+            detached("gamma"),
+        ];
+        // Bare {x}: prefix and suffix both empty -> all names.
+        assert_eq!(
+            candidate_values(&sessions, &vmap(&[("x", "alpha")]), "x"),
+            vec!["alpha", "beta", "gamma"],
+        );
+    }
+
+    #[test]
+    fn candidate_values_no_attached_template_yields_current_only() {
+        let sessions = vec![attached("myproj-edit", "{workspace}-edit", 1)];
+        // No template references {gone} -> just the current value.
+        assert_eq!(
+            candidate_values(&sessions, &vmap(&[("gone", "cur")]), "gone"),
+            vec!["cur"],
+        );
+    }
+
+    #[test]
+    fn candidate_values_multibyte_name_is_char_safe() {
+        // café-edit / naïve-edit: the strip works on characters, never
+        // panicking on a byte boundary inside a multibyte char.
+        let sessions = vec![attached("café-edit", "{w}-edit", 1), detached("naïve-edit")];
+        let c = candidate_values(&sessions, &vmap(&[("w", "café")]), "w");
+        assert_eq!(c, vec!["café", "naïve"]);
+        assert_eq!(c[1].chars().count(), 5, "naïve is 5 characters");
+    }
+
+    #[test]
+    fn candidate_values_empty_capture_is_dropped() {
+        // A session named exactly "-edit" would capture "" under
+        // {w}-edit; that empty capture is dropped, "real" kept.
+        let sessions = vec![attached("-edit", "{w}-edit", 1), detached("real-edit")];
+        assert_eq!(
+            candidate_values(&sessions, &vmap(&[("w", "cur")]), "w"),
+            vec!["cur", "real"],
+        );
+    }
+
+    #[test]
+    fn candidate_values_repeated_token_template_is_skipped() {
+        let sessions = vec![attached("a-a", "{v}-{v}", 1), attached("x-y", "{v}-y", 2)];
+        // {v}-{v} skipped (token appears twice); {v}-y still captures x.
+        assert_eq!(
+            candidate_values(&sessions, &vmap(&[("v", "a")]), "v"),
+            vec!["a", "x"],
+        );
+    }
+
+    // -- filter_rank --
+
+    fn strs(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn filter_rank_ascii_case_insensitive_subsequence() {
+        // Folded query matches a folded candidate; non-match dropped.
+        assert_eq!(filter_rank(&strs(&["XRP", "abc"]), "xrp"), vec!["XRP"]);
+    }
+
+    #[test]
+    fn filter_rank_exact_match_sorts_to_top() {
+        // The exact candidate outranks the longer subsequence matches.
+        assert_eq!(
+            filter_rank(&strs(&["xrpz", "xrp", "xrpa"]), "xrp"),
+            vec!["xrp", "xrpz", "xrpa"],
+        );
+    }
+
+    #[test]
+    fn filter_rank_contiguous_before_scattered() {
+        // xrp (contains "xr") outranks xmr (scattered); djt drops out.
+        assert_eq!(
+            filter_rank(&strs(&["xmr", "xrp", "djt"]), "xr"),
+            vec!["xrp", "xmr"],
+        );
+    }
+
+    #[test]
+    fn filter_rank_sparse_subsequence_matches() {
+        // k...b is a subsequence of key-bugfix; unrelated drops out.
+        assert_eq!(
+            filter_rank(&strs(&["key-bugfix", "unrelated"]), "kb"),
+            vec!["key-bugfix"],
+        );
+    }
+
+    #[test]
+    fn filter_rank_empty_query_keeps_harvest_order() {
+        assert_eq!(
+            filter_rank(&strs(&["c", "a", "b"]), ""),
+            vec!["c", "a", "b"],
+        );
+    }
+
+    #[test]
+    fn filter_rank_harvest_index_is_final_tiebreak() {
+        // Both contiguous, first-match index 0, same char count -> input
+        // order preserved by the harvest-index tiebreak.
+        assert_eq!(
+            filter_rank(&strs(&["abx", "aby"]), "ab"),
+            vec!["abx", "aby"],
+        );
+    }
+
+    #[test]
+    fn filter_rank_length_compared_by_chars_not_bytes() {
+        // Both contain folded "x"; "Xé" is 2 chars, "aXc" is 3 chars, so
+        // the multibyte 2-char candidate sorts first.
+        assert_eq!(filter_rank(&strs(&["aXc", "Xé"]), "x"), vec!["Xé", "aXc"]);
     }
 }

@@ -1,12 +1,15 @@
 ---
 source: src/tui/view.rs
-expression: "render_visible(&m, 72, 10)"
+expression: "render_visible(&m, 72, 14)"
 ---
                              variables (2)                              
    editor    = vim   (1 session)
  > workspace = myproj   (2 sessions)                                    
+  candidate values:
+   myproj
+ > demo                                                                 
 
   {workspace} attachments:
-    {workspace}-edit         myproj-edit      pid 111  -> newproj-edit
-    {workspace}-term         myproj-term      pid 222  -> newproj-term
-  set workspace = newproj_   (ret: apply, esc: cancel)
+    {workspace}-edit         myproj-edit      pid 111  -> demo-edit
+    {workspace}-term         myproj-term      pid 222  -> demo-term
+  set workspace = demo_   (ret: apply, esc: cancel)
