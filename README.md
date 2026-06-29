@@ -24,6 +24,10 @@ Press `v` to manage `shpool`'s template variables and their attached sessions.
                               variables (2)
  > coin   = djt   (1 session)
    editor = acme   (1 session)
+  candidate values:
+   djt
+ > xmr
+   xrp
 
   {coin} attachments:
     {coin}-miner             djt-miner        pid 4321  -> xmr-miner
